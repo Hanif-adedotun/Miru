@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Miru",
+  "version": "0.1.0",
+  "description": "AI-driven browser agent for natural language instructions",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background/serviceWorker.js",
+    "type": "module"
+  },
+  "content_scripts": [],
+  "action": {
+    "default_popup": "ui/popup.html",
+    "default_icon": {
+      "16": "../public/icon.png",
+      "48": "../public/icon.png",
+      "128": "../public/icon.png"
+    }
+  },
+  "icons": {
+    "16": "public/icon.png",
+    "48": "public/icon.png",
+    "128": "public/icon.png"
+  },
+  "web_accessible_resources": []
+}
+

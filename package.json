@@ -1,0 +1,25 @@
+{
+  "name": "miru",
+  "version": "0.1.0",
+  "description": "AI-driven browser agent for Chrome",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && npm run copy-assets",
+    "copy-assets": "mkdir -p dist && cp -r public dist/ && cp src/manifest.json dist/ && cp src/ui/*.html dist/ui/ && cp src/ui/*.css dist/ui/",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "chrome-extension",
+    "browser-automation",
+    "ai-agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  }
+}
+

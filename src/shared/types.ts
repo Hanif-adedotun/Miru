@@ -29,6 +29,8 @@ export interface PageSummary {
  * Message types for communication between popup, service worker, and content script
  */
 export type MessageType =
+  | "PING"
+  | "PONG"
   | "GET_PAGE_SUMMARY"
   | "EXECUTE_ACTION"
   | "QUERY_ELEMENTS"
@@ -80,4 +82,7 @@ export interface ErrorMessage extends Message {
   type: "ERROR";
   error: string;
 }
+
+
+
 

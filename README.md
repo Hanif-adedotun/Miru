@@ -73,6 +73,12 @@ This will:
    - Link count
    - Form count
 
+## Documentation
+
+- [Product Requirements Document](docs/PRD.md)
+- [Chrome Extension Architecture](docs/ARCHITECTURE.md)
+- [Chrome Web Store Approval Guide](docs/CHROME_WEB_STORE_APPROVAL.md)
+
 ## Development
 
 ### Watch Mode
@@ -127,4 +133,3 @@ This is the foundation. Future enhancements will include:
 ## License
 
 MIT
-

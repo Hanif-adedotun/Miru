@@ -68,3 +68,6 @@ getSummaryBtn.addEventListener("click", async () => {
 // Initialize
 console.log("[Miru] Popup initialized");
 
+
+
+

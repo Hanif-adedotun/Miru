@@ -194,3 +194,6 @@ chrome.runtime.onMessage.addListener(
 // Log content script initialization
 console.log("[Miru] Content script loaded on", window.location.href);
 
+
+
+

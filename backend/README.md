@@ -7,6 +7,7 @@ It does three things:
 - receives page context from the extension
 - returns a structured next action
 - stores session and planning history in Supabase when configured
+- calls Groq for model-backed planning when configured
 
 The backend also sends permissive CORS headers in the MVP so the Chrome extension can call it during local development.
 
@@ -20,11 +21,11 @@ The MVP backend is intentionally narrow:
 
 - `GET /health`
 - `POST /v1/plan`
-- heuristic planner for the demo
+- Groq model-backed planner with structured outputs
 - Supabase-backed session and plan persistence
 - in-memory fallback when Supabase is not configured
 
-That gives us an end-to-end demo now, and a clean place to swap in model inference next.
+That gives us an end-to-end demo now while keeping the extension-side action contract stable.
 
 ## Folder Structure
 
@@ -51,8 +52,11 @@ Copy `.env.example` to `.env` and fill in:
 - `HOST`
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+- `GROQ_API_KEY`
+- `GROQ_MODEL`
 
 If the Supabase values are missing, the backend still runs with in-memory storage for local demos.
+If `GROQ_API_KEY` is missing, the backend cannot call the model-backed planner.
 
 ## Local Run
 
@@ -128,4 +132,4 @@ Apply the SQL migration in [supabase/migrations/20260422_init_miru_backend.sql](
 
 ## Next Step
 
-The next backend step is to replace the heuristic planner with a model-backed planner while keeping the exact same response shape.
+The next backend step is to tune the prompt and validation strategy so Miru can make stronger page decisions with the same response shape.

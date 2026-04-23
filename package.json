@@ -4,9 +4,10 @@
   "description": "AI-driven browser agent for Chrome",
   "type": "module",
   "scripts": {
-    "build": "node scripts/generate-extension-config.mjs && tsc && npm run copy-assets",
+    "build": "node scripts/generate-extension-config.mjs && tsc -p tsconfig.build.json && npm run bundle:content && npm run copy-assets",
+    "bundle:content": "esbuild src/content/contentScript.ts --bundle --format=iife --platform=browser --outfile=dist/content/contentScript.js",
     "copy-assets": "mkdir -p dist && cp -r public dist/ && cp src/manifest.json dist/ && cp src/ui/*.html dist/ui/ && cp src/ui/*.css dist/ui/",
-    "watch": "node scripts/generate-extension-config.mjs && tsc --watch",
+    "watch": "node scripts/generate-extension-config.mjs && concurrently -k \"tsc -p tsconfig.build.json --watch --preserveWatchOutput\" \"npm run bundle:content -- --watch\"",
     "clean": "rm -rf dist"
   },
   "keywords": [
@@ -19,6 +20,8 @@
   "devDependencies": {
     "@types/chrome": "^0.0.268",
     "@types/node": "^20.10.0",
+    "concurrently": "^9.1.2",
+    "esbuild": "^0.25.0",
     "typescript": "^5.3.3"
   }
 }

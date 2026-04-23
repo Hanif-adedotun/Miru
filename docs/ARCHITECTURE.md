@@ -17,8 +17,8 @@ The current project already matches a basic MV3 structure:
 
 - `src/background/serviceWorker.ts`
 - `src/content/contentScript.ts`
-- `src/ui/popup.html`
-- `src/ui/popup.ts`
+- `src/ui/sidepanel.html`
+- `src/ui/sidepanel.ts`
 - `src/shared/types.ts`
 - `src/manifest.json`
 
@@ -28,7 +28,7 @@ That is a good foundation, but Miru will need a clearer separation between captu
 
 ### Extension Components
 
-#### Popup UI
+#### Side Panel UI
 
 Responsibilities:
 
@@ -41,9 +41,9 @@ Responsibilities:
 
 Notes:
 
-- good for short sessions
-- limited screen space
-- may need to hand off to a side panel in a later version
+- primary Miru shell for task sessions
+- remains visible while the page changes
+- fits screenshot review, action approvals, and history much better than a popup
 
 #### Background Service Worker
 
@@ -78,19 +78,6 @@ Constraints:
 - must avoid unsafe execution patterns
 - should operate from structured action payloads only
 
-#### Optional Side Panel
-
-Recommendation:
-
-- strongly consider adding a side panel for V1.5 or V2 if multi-step workflows outgrow popup UX
-
-Use cases:
-
-- longer task history
-- larger screenshot previews
-- review of extraction results
-- step-by-step debugging
-
 #### Remote Backend
 
 Responsibilities:
@@ -111,7 +98,7 @@ Critical rule:
 ### Core Loop
 
 1. User invokes Miru from the extension action.
-2. Popup requests a context capture.
+2. Side panel requests a context capture.
 3. Service worker:
    - verifies active tab access
    - captures screenshot
@@ -119,7 +106,7 @@ Critical rule:
 4. Service worker builds a normalized context payload.
 5. Service worker sends the payload to backend planning.
 6. Backend returns a structured action or extraction response.
-7. Popup displays the plan.
+7. Side panel displays the plan.
 8. User approves if required.
 9. Service worker forwards a structured action to the content script.
 10. Content script executes the action and returns a result.
@@ -355,4 +342,3 @@ Pre-submission checks:
 - verify permission prompts match product claims
 - verify no remote code paths
 - verify privacy disclosures match actual traffic
-

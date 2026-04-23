@@ -4,9 +4,9 @@
   "description": "AI-driven browser agent for Chrome",
   "type": "module",
   "scripts": {
-    "build": "tsc && npm run copy-assets",
+    "build": "node scripts/generate-extension-config.mjs && tsc && npm run copy-assets",
     "copy-assets": "mkdir -p dist && cp -r public dist/ && cp src/manifest.json dist/ && cp src/ui/*.html dist/ui/ && cp src/ui/*.css dist/ui/",
-    "watch": "tsc --watch",
+    "watch": "node scripts/generate-extension-config.mjs && tsc --watch",
     "clean": "rm -rf dist"
   },
   "keywords": [
@@ -22,4 +22,3 @@
     "typescript": "^5.3.3"
   }
 }
-

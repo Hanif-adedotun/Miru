@@ -289,7 +289,7 @@ V1 metrics:
 - Chrome Web Store reviewers may view broad permissions and screenshot capture as high risk.
 - Remote AI usage may trigger privacy and disclosure scrutiny.
 - Reviewers may reject behavior that resembles remote command execution instead of constrained action planning.
-- Dynamic websites may require more context than a popup-only UI can handle.
+- Dynamic websites need a side-panel-oriented UI so users can inspect context and approve actions without popup limits.
 - Service worker lifecycle can interrupt longer sessions if state management is weak.
 
 ## 16. V1 Release Recommendation
@@ -310,4 +310,3 @@ V1 should be intentionally narrow:
 - Should auto-run be available in V1, or only after Guided Mode proves stable?
 - Should Miru support all sites at launch, or only user-approved origins?
 - Should HTML be full-document, visible-region only, or summarized DOM blocks?
-

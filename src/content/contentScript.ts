@@ -1,199 +1,320 @@
 /**
  * Content script for Miru
- * Reads DOM, extracts page information, and executes actions
+ * Reads DOM, extracts page information, and executes constrained actions
  */
 
 import type {
-  Message,
-  PageSummary,
-  PageSummaryResponseMessage,
+  ActionResultMessage,
+  ElementSummary,
   ErrorMessage,
-  QueryElementsMessage,
-  HighlightElementMessage,
+  ExecuteActionMessage,
+  ExtractionField,
+  Message,
+  PageContext,
 } from "../shared/types.js";
-import { MESSAGE_SOURCE, HIGHLIGHT_STYLE_ID, HIGHLIGHT_CLASS } from "../shared/constants.js";
+import {
+  HIGHLIGHT_CLASS,
+  HIGHLIGHT_STYLE_ID,
+  MESSAGE_SOURCE,
+} from "../shared/constants.js";
 
-/**
- * Get a summary of the current page
- */
-function getPageSummary(): PageSummary {
-  const url = window.location.href;
-  const title = document.title;
+function buildSelector(element: Element): string {
+  if (element.id) {
+    return `#${CSS.escape(element.id)}`;
+  }
 
-  // Get visible text (approximate)
-  const bodyText = document.body.innerText || "";
-  const visibleTextLength = bodyText.length;
+  const namedElement = element as HTMLElement;
+  if (namedElement.dataset?.miruSelector) {
+    return namedElement.dataset.miruSelector;
+  }
 
-  // Count links
-  const links = document.querySelectorAll("a[href]");
-  const linkCount = links.length;
+  const tagName = element.tagName.toLowerCase();
+  const classes = Array.from(element.classList).slice(0, 2).map((name) => `.${CSS.escape(name)}`);
 
-  // Count forms
-  const forms = document.querySelectorAll("form");
-  const formCount = forms.length;
+  if (classes.length > 0) {
+    return `${tagName}${classes.join("")}`;
+  }
+
+  const parent = element.parentElement;
+  if (!parent) {
+    return tagName;
+  }
+
+  const siblings = Array.from(parent.children).filter((child) => child.tagName === element.tagName);
+  const position = siblings.indexOf(element) + 1;
+  return `${tagName}:nth-of-type(${position})`;
+}
+
+function summarizeElement(element: Element): ElementSummary {
+  const htmlElement = element as HTMLElement;
+  const text = (htmlElement.innerText || htmlElement.getAttribute("aria-label") || htmlElement.id || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 72);
 
   return {
-    url,
-    title,
-    visibleTextLength,
-    linkCount,
-    formCount,
+    selector: buildSelector(element),
+    label: text || element.tagName.toLowerCase(),
+    tagName: element.tagName.toLowerCase(),
+    role: htmlElement.getAttribute("role") || undefined,
+  };
+}
+
+function getInteractiveElements(): ElementSummary[] {
+  const selector = 'button, a[href], input, textarea, select, [role="button"]';
+  const elements = Array.from(document.querySelectorAll(selector))
+    .filter((element) => {
+      const htmlElement = element as HTMLElement;
+      const style = window.getComputedStyle(htmlElement);
+      return style.display !== "none" && style.visibility !== "hidden";
+    })
+    .slice(0, 12);
+
+  return elements.map(summarizeElement);
+}
+
+function getHtmlPreview(): string {
+  const source = document.body?.innerHTML || "";
+  return source.replace(/\s+/g, " ").trim().slice(0, 5000);
+}
+
+function getPageContext(): PageContext {
+  const bodyText = document.body?.innerText || "";
+
+  return {
+    url: window.location.href,
+    title: document.title,
+    visibleTextLength: bodyText.length,
+    linkCount: document.querySelectorAll("a[href]").length,
+    formCount: document.querySelectorAll("form").length,
+    htmlPreview: getHtmlPreview(),
+    interactiveElements: getInteractiveElements(),
     timestamp: Date.now(),
   };
 }
 
-/**
- * Query elements by selector
- */
-function queryElements(selector: string): Element[] {
+function queryElement(selector: string): Element | null {
   try {
-    return Array.from(document.querySelectorAll(selector));
+    return document.querySelector(selector);
   } catch (error) {
     console.error("[Miru] Invalid selector:", selector, error);
-    return [];
+    return null;
   }
 }
 
-/**
- * Highlight an element (for debugging/inspection)
- */
-function highlightElement(element: Element | null): void {
-  if (!element) return;
+function ensureHighlightStyle(): void {
+  if (document.getElementById(HIGHLIGHT_STYLE_ID)) {
+    return;
+  }
 
-  // Remove previous highlights
-  document.querySelectorAll(`.${HIGHLIGHT_CLASS}`).forEach((el) => {
-    el.classList.remove(HIGHLIGHT_CLASS);
+  const style = document.createElement("style");
+  style.id = HIGHLIGHT_STYLE_ID;
+  style.textContent = `
+    .${HIGHLIGHT_CLASS} {
+      outline: 3px solid rgba(56, 189, 248, 0.95) !important;
+      outline-offset: 3px !important;
+      box-shadow: 0 0 0 6px rgba(125, 211, 252, 0.22) !important;
+      border-radius: 12px !important;
+      transition: box-shadow 180ms ease, outline-color 180ms ease !important;
+    }
+  `;
+
+  document.head.appendChild(style);
+}
+
+function highlightElement(element: Element | null): void {
+  if (!element) {
+    return;
+  }
+
+  ensureHighlightStyle();
+  document.querySelectorAll(`.${HIGHLIGHT_CLASS}`).forEach((node) => {
+    node.classList.remove(HIGHLIGHT_CLASS);
   });
 
-  // Add highlight style if not already present
-  if (!document.getElementById(HIGHLIGHT_STYLE_ID)) {
-    const style = document.createElement("style");
-    style.id = HIGHLIGHT_STYLE_ID;
-    style.textContent = `
-      .${HIGHLIGHT_CLASS} {
-        outline: 3px solid #ff6b6b !important;
-        outline-offset: 2px !important;
-        background-color: rgba(255, 107, 107, 0.1) !important;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  // Highlight the element
   element.classList.add(HIGHLIGHT_CLASS);
-
-  // Scroll element into view
-  element.scrollIntoView({ behavior: "smooth", block: "center" });
+  (element as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
-/**
- * Handle messages from service worker
- */
+function extractField(field: ExtractionField): string | null {
+  const element = queryElement(field.selector);
+  if (!element) {
+    return null;
+  }
+
+  if (field.attr) {
+    return element.getAttribute(field.attr);
+  }
+
+  return (element as HTMLElement).innerText?.trim() || element.textContent?.trim() || null;
+}
+
+async function executeAction(message: ExecuteActionMessage): Promise<ActionResultMessage | ErrorMessage> {
+  const action = message.payload;
+
+  try {
+    switch (action.type) {
+      case "QUERY": {
+        const element = queryElement(action.selector);
+        if (!element) {
+          return { type: "ERROR", error: "No element found for selector" };
+        }
+
+        highlightElement(element);
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: summarizeElement(element),
+          },
+        };
+      }
+
+      case "CLICK": {
+        const element = queryElement(action.selector);
+        if (!element) {
+          return { type: "ERROR", error: "No clickable element found for selector" };
+        }
+
+        highlightElement(element);
+        (element as HTMLElement).click();
+
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: { clicked: action.selector },
+          },
+        };
+      }
+
+      case "TYPE": {
+        const element = queryElement(action.selector);
+        if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+          return { type: "ERROR", error: "Target is not a text input" };
+        }
+
+        highlightElement(element);
+        element.focus();
+        element.value = action.text;
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: { typed: true, selector: action.selector },
+          },
+        };
+      }
+
+      case "SCROLL": {
+        const amount = action.amount ?? 640;
+        if (action.direction === "up") {
+          window.scrollBy({ top: -amount, behavior: "smooth" });
+        } else if (action.direction === "down") {
+          window.scrollBy({ top: amount, behavior: "smooth" });
+        } else {
+          window.scrollTo({ top: amount, behavior: "smooth" });
+        }
+
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: { direction: action.direction, amount },
+          },
+        };
+      }
+
+      case "WAIT": {
+        await new Promise((resolve) => setTimeout(resolve, action.durationMs));
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: { waited: action.durationMs },
+          },
+        };
+      }
+
+      case "EXTRACT": {
+        const extracted = action.fields.reduce<Record<string, string | null>>((accumulator, field) => {
+          accumulator[field.name] = extractField(field);
+          return accumulator;
+        }, {});
+
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: extracted,
+          },
+        };
+      }
+
+      case "STOP": {
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: { stopped: true, reason: action.reason },
+          },
+        };
+      }
+
+      default:
+        return {
+          type: "ERROR",
+          error: `Unknown action type: ${(action as Message).type}`,
+        };
+    }
+  } catch (error) {
+    return {
+      type: "ERROR",
+      error: error instanceof Error ? error.message : "Unknown action failure",
+    };
+  }
+}
+
 chrome.runtime.onMessage.addListener(
   (
     message: Message,
-    sender: chrome.runtime.MessageSender,
+    _sender: chrome.runtime.MessageSender,
     sendResponse: (response: Message) => void
   ) => {
-    // Verify message source
-    if ((message as any).source !== MESSAGE_SOURCE) {
+    if (message.source !== MESSAGE_SOURCE) {
       return false;
     }
 
-    try {
-      switch (message.type) {
-        case "GET_PAGE_SUMMARY": {
-          const summary = getPageSummary();
-          const response: PageSummaryResponseMessage = {
-            type: "PAGE_SUMMARY_RESPONSE",
-            payload: summary,
-          };
-          sendResponse(response);
-          return true;
-        }
-
-        case "QUERY_ELEMENTS": {
-          const { selector } = (message as QueryElementsMessage).payload || {};
-          if (!selector) {
-            sendResponse({
-              type: "ERROR",
-              error: "Selector is required",
-            } as ErrorMessage);
-            return true;
-          }
-          const elements = queryElements(selector);
-          sendResponse({
-            type: "ACTION_RESULT",
-            payload: {
-              success: true,
-              result: {
-                count: elements.length,
-                elements: elements.map((el) => ({
-                  tagName: el.tagName,
-                  id: el.id,
-                  className: el.className,
-                  textContent: el.textContent?.slice(0, 100),
-                })),
-              },
-            },
-          });
-          return true;
-        }
-
-        case "HIGHLIGHT_ELEMENT": {
-          const { selector } = (message as HighlightElementMessage).payload || {};
-          if (!selector) {
-            sendResponse({
-              type: "ERROR",
-              error: "Selector is required",
-            } as ErrorMessage);
-            return true;
-          }
-          const elements = queryElements(selector);
-          if (elements.length === 0) {
-            sendResponse({
-              type: "ERROR",
-              error: "No elements found for selector",
-            } as ErrorMessage);
-            return true;
-          }
-          highlightElement(elements[0]);
-          sendResponse({
-            type: "ACTION_RESULT",
-            payload: {
-              success: true,
-              result: { highlighted: true },
-            },
-          });
-          return true;
-        }
-
-        case "PING": {
-          // Respond to ping to confirm content script is loaded
-          sendResponse({ type: "PONG" } as Message);
-          return true;
-        }
-
-        default:
-          sendResponse({
-            type: "ERROR",
-            error: `Unknown message type: ${message.type}`,
-          } as ErrorMessage);
-          return true;
-      }
-    } catch (error) {
-      sendResponse({
-        type: "ERROR",
-        error: error instanceof Error ? error.message : "Unknown error",
-      } as ErrorMessage);
+    if (message.type === "PING") {
+      sendResponse({ type: "PONG" });
       return true;
     }
+
+    if (message.type === "GET_PAGE_CONTEXT") {
+      sendResponse({
+        type: "ACTION_RESULT",
+        payload: {
+          success: true,
+          result: getPageContext(),
+        },
+      });
+      return true;
+    }
+
+    if (message.type === "EXECUTE_ACTION") {
+      void executeAction(message as ExecuteActionMessage).then((response) => sendResponse(response));
+      return true;
+    }
+
+    sendResponse({
+      type: "ERROR",
+      error: `Unsupported message type: ${message.type}`,
+    });
+    return true;
   }
 );
 
-// Log content script initialization
 console.log("[Miru] Content script loaded on", window.location.href);
-
-
-
-

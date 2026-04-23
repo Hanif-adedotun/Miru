@@ -7,10 +7,12 @@
     "activeTab",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "sidePanel"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "http://localhost:3001/*",
+    "https://localhost:3001/*"
   ],
   "background": {
     "service_worker": "background/serviceWorker.js",
@@ -18,12 +20,15 @@
   },
   "content_scripts": [],
   "action": {
-    "default_popup": "ui/popup.html",
+    "default_title": "Open Miru",
     "default_icon": {
       "16": "public/icon16.png",
       "48": "public/icon48.png",
       "128": "public/icon128.png"
     }
+  },
+  "side_panel": {
+    "default_path": "ui/sidepanel.html"
   },
   "icons": {
     "16": "public/icon16.png",
@@ -32,7 +37,4 @@
   },
   "web_accessible_resources": []
 }
-
-
-
 

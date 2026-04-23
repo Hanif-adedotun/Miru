@@ -12,9 +12,11 @@ miru/
 │  ├─ content/
 │  │  └─ contentScript.ts        # DOM reader & executor
 │  ├─ ui/
-│  │  ├─ popup.html
-│  │  ├─ popup.ts
-│  │  └─ popup.css
+│  │  ├─ sidepanel.html
+│  │  ├─ sidepanel.ts
+│  │  ├─ sidepanel.css
+│  │  ├─ app.ts
+│  │  └─ app.css
 │  ├─ shared/
 │  │  ├─ types.ts                # Action schemas & message types
 │  │  └─ constants.ts
@@ -43,6 +45,20 @@ Before building, you need to add an icon file:
 npm install
 ```
 
+### 1.5 Configure The Backend URL
+
+```bash
+cp .env.example .env
+```
+
+Set `MIRU_BACKEND_URL` to the backend you want the extension to call.
+
+For local development, the default is:
+
+```bash
+MIRU_BACKEND_URL=http://localhost:3001
+```
+
 ### 2. Build the Extension
 
 ```bash
@@ -50,6 +66,7 @@ npm run build
 ```
 
 This will:
+- Generate the extension runtime config from `.env`
 - Compile TypeScript files to JavaScript
 - Copy manifest.json and public assets to `dist/`
 
@@ -65,19 +82,22 @@ This will:
 
 1. Navigate to any website (e.g., `https://example.com`)
 2. Click the Miru extension icon in the Chrome toolbar
-3. Click "Get Page Summary" button
-4. You should see JSON output with:
+3. The Miru side panel should open
+4. Start a session and you should see:
    - URL
    - Page title
    - Visible text length
    - Link count
    - Form count
+   - Screenshot preview
+   - HTML preview
 
 ## Documentation
 
 - [Product Requirements Document](docs/PRD.md)
 - [Chrome Extension Architecture](docs/ARCHITECTURE.md)
 - [Chrome Web Store Approval Guide](docs/CHROME_WEB_STORE_APPROVAL.md)
+- [Backend MVP Guide](backend/README.md)
 
 ## Development
 
@@ -98,20 +118,21 @@ npm run build
 
 ## File Structure
 
-- **`src/background/serviceWorker.ts`**: Background service worker that orchestrates tasks and manages communication between popup and content scripts
+- **`src/background/serviceWorker.ts`**: Background service worker that orchestrates tasks and manages communication between the side panel and content scripts
 - **`src/content/contentScript.ts`**: Content script injected into web pages to read DOM, extract page information, and execute actions
-- **`src/ui/popup.ts`**: Popup UI controller that handles user interactions and displays results
+- **`src/ui/sidepanel.ts`**: Side panel entry point for the Miru session shell
+- **`src/ui/app.ts`**: Shared side panel app renderer and interaction layer
 - **`src/shared/types.ts`**: Shared type definitions including action schemas and message types
 - **`src/shared/constants.ts`**: Shared constants used across the extension
 
 ## Messaging Flow
 
-1. User clicks popup button
-2. Popup sends message → service worker
-3. Service worker injects content script (if needed)
-4. Content script reads page metadata and returns structured response
-5. Service worker sends result back to popup
-6. Popup displays JSON output
+1. User clicks the extension icon and opens the side panel
+2. The side panel sends session commands to the service worker
+3. Service worker injects content script if needed
+4. Content script reads page metadata and executes constrained actions
+5. Service worker stores session state and returns updates
+6. The side panel renders context, screenshots, and action history
 
 ## Permissions
 
@@ -120,7 +141,7 @@ The extension uses:
 - `scripting`: Inject content scripts
 - `storage`: Store extension data (for future use)
 - `tabs`: Query tab information
-- `<all_urls>`: Access to all websites
+- `sidePanel`: Open Miru in Chrome's side panel
 
 ## Next Steps
 

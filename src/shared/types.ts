@@ -2,40 +2,130 @@
  * Shared type definitions for Miru extension
  */
 
-/**
- * Action types that the AI planner can generate
- */
+export type MiruMode = "auto" | "ask" | "interactive";
+
+export type SessionStatus =
+  | "idle"
+  | "capturing"
+  | "planning"
+  | "awaiting_approval"
+  | "ready"
+  | "executing"
+  | "complete"
+  | "error";
+
+export type ActionRisk = "low" | "medium" | "high";
+
+export type EventStatus = "info" | "success" | "warning" | "error";
+
+export interface ElementSummary {
+  selector: string;
+  label: string;
+  tagName: string;
+  role?: string;
+}
+
+export interface ExtractionField {
+  name: string;
+  selector: string;
+  attr?: string;
+}
+
 export type MiruAction =
   | { type: "QUERY"; selector: string }
   | { type: "CLICK"; selector: string }
-  | { type: "EXTRACT"; selector: string; fields?: Record<string, string> }
+  | { type: "EXTRACT"; fields: ExtractionField[] }
   | { type: "TYPE"; selector: string; text: string }
   | { type: "SCROLL"; direction: "up" | "down" | "to"; amount?: number }
-  | { type: "WAIT"; duration: number };
+  | { type: "WAIT"; durationMs: number }
+  | { type: "STOP"; reason: string };
 
-/**
- * Page summary information
- */
-export interface PageSummary {
+export interface PageContext {
   url: string;
   title: string;
   visibleTextLength: number;
   linkCount: number;
   formCount: number;
+  htmlPreview: string;
+  interactiveElements: ElementSummary[];
   timestamp: number;
+  screenshotDataUrl?: string;
 }
 
-/**
- * Message types for communication between popup, service worker, and content script
- */
+export interface ProposedAction {
+  id: string;
+  action: MiruAction;
+  rationale: string;
+  confidence: number;
+  risk: ActionRisk;
+  requiresConfirmation: boolean;
+}
+
+export interface ActionResultPayload {
+  success: boolean;
+  result?: unknown;
+  error?: string;
+}
+
+export interface SessionEvent {
+  id: string;
+  title: string;
+  detail: string;
+  status: EventStatus;
+  createdAt: number;
+}
+
+export interface SessionState {
+  id: string | null;
+  mode: MiruMode;
+  prompt: string;
+  status: SessionStatus;
+  tabId?: number;
+  origin?: string;
+  currentContext?: PageContext;
+  pendingAction?: ProposedAction;
+  lastResult?: ActionResultPayload;
+  history: SessionEvent[];
+  lastError?: string;
+  createdAt?: number;
+  updatedAt: number;
+}
+
+export interface PlannerEvent {
+  title: string;
+  detail: string;
+  createdAt: number;
+}
+
+export interface PlannerRequest {
+  sessionId?: string;
+  prompt: string;
+  mode: MiruMode;
+  context: PageContext;
+  history?: PlannerEvent[];
+}
+
+export interface PlannerResponse {
+  sessionId: string;
+  proposedAction: ProposedAction;
+  memory: {
+    previousPlans: number;
+    storedInSupabase: boolean;
+  };
+}
+
 export type MessageType =
   | "PING"
   | "PONG"
-  | "GET_PAGE_SUMMARY"
+  | "GET_PAGE_CONTEXT"
   | "EXECUTE_ACTION"
-  | "QUERY_ELEMENTS"
-  | "HIGHLIGHT_ELEMENT"
-  | "PAGE_SUMMARY_RESPONSE"
+  | "GET_SESSION"
+  | "START_SESSION"
+  | "PLAN_NEXT_ACTION"
+  | "APPROVE_PENDING_ACTION"
+  | "REFRESH_CONTEXT"
+  | "STOP_SESSION"
+  | "SESSION_RESPONSE"
   | "ACTION_RESULT"
   | "ERROR";
 
@@ -43,25 +133,17 @@ export interface Message {
   type: MessageType;
   payload?: unknown;
   error?: string;
+  source?: string;
 }
 
-export interface GetPageSummaryMessage extends Message {
-  type: "GET_PAGE_SUMMARY";
+export interface StartSessionPayload {
+  prompt: string;
+  mode: MiruMode;
 }
 
-export interface PageSummaryResponseMessage extends Message {
-  type: "PAGE_SUMMARY_RESPONSE";
-  payload: PageSummary;
-}
-
-export interface QueryElementsMessage extends Message {
-  type: "QUERY_ELEMENTS";
-  payload: { selector: string };
-}
-
-export interface HighlightElementMessage extends Message {
-  type: "HIGHLIGHT_ELEMENT";
-  payload: { selector: string };
+export interface SessionResponseMessage extends Message {
+  type: "SESSION_RESPONSE";
+  payload: SessionState;
 }
 
 export interface ExecuteActionMessage extends Message {
@@ -71,18 +153,10 @@ export interface ExecuteActionMessage extends Message {
 
 export interface ActionResultMessage extends Message {
   type: "ACTION_RESULT";
-  payload: {
-    success: boolean;
-    result?: unknown;
-    error?: string;
-  };
+  payload: ActionResultPayload;
 }
 
 export interface ErrorMessage extends Message {
   type: "ERROR";
   error: string;
 }
-
-
-
-

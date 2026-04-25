@@ -9,11 +9,11 @@
 
 ## 1. Product Summary
 
-Miru is a developer tool for building, refining, and replaying browser interaction workflows from a Chrome extension. It is designed to replace low-level Selenium-style scripting for crawling and extraction on complex websites.
+Miru is a chat-first developer tool for building, refining, and replaying browser interaction workflows from a Chrome extension. It is designed to replace low-level Selenium-style scripting for crawling and extraction on complex websites.
 
-Miru combines browser automation with page awareness. It can inspect the current page HTML and screenshot, build context from both, generate or refine the next command in a workflow, execute that command on the live page, and then reuse the resulting command stream as a repeatable extraction routine.
+Miru combines browser automation with page awareness. A user should be able to describe a task in chat, watch Miru think, see the next command it plans to run, and then observe the page change in response. Behind that conversational interface, Miru builds a constrained command stream that can later be saved, replayed, repaired, and exported as executable JavaScript.
 
-The core value is not one-off automation alone. The value is a premium workflow authoring experience for developers: visible, inspectable, reusable browser procedures without hand-writing brittle crawling code.
+The core value is not one-off automation alone. The value is a premium conversational workflow authoring experience for developers: visible, inspectable, reusable browser procedures without hand-writing brittle crawling code.
 
 ## 2. Problem Statement
 
@@ -30,13 +30,14 @@ Miru should solve this by giving developers a browser-native tool that can obser
 
 ## 3. Product Vision
 
-Miru should feel like a visual workflow builder for browser extraction:
+Miru should feel like a chat-based browser operator for browser extraction:
 
 - it runs inside Chrome
 - it interacts with the page the user is already viewing
-- it exposes what it sees, what command it plans to run next, and how the workflow evolves
+- it exposes what it sees, what it is thinking, what command it plans to run next, and how the workflow evolves
 - it supports extraction and interaction on hard-to-script sites
 - it turns successful sessions into reusable routines
+- it can export a recorded session as JavaScript
 
 ## 4. Target Users
 
@@ -74,14 +75,18 @@ Miru combines three capabilities in one product:
 ### In Scope
 
 - run as a Chrome extension on Manifest V3
+- provide a chat-first UI with a fixed composer and readable assistant responses
 - read the current page DOM and metadata after explicit user invocation
 - capture the visible tab screenshot after explicit user invocation
 - send page context and workflow state to a planning layer
 - return a structured next command or extraction plan
 - execute approved page actions such as click, type, scroll, wait, and extract
-- maintain a visible command timeline for the current workflow
+- maintain a visible chat transcript for the current workflow
+- show assistant states such as thinking, planning, running, and result
 - let users refine a workflow after each step or run
 - promote a successful session into a reusable extraction routine
+- allow the user to record a session
+- export a recorded session as executable JavaScript scaffolding
 - rerun a saved or generated command stream against the same site pattern
 - show users the current page state, planned command, and action result
 - maintain session history for the current task
@@ -103,6 +108,7 @@ Miru combines three capabilities in one product:
 - User-invoked: Miru acts after a clear user gesture.
 - Inspectable: Miru shows the current state, proposed command, and result.
 - Workflow-first: Miru should help developers build and refine repeatable browser procedures, not just take isolated actions.
+- Chat-first: the primary user-facing interface should be a readable conversation, not a dashboard.
 - Narrowly scoped: Miru is a developer browser interaction and extraction tool, not a general browsing assistant.
 - Safe by default: Miru minimizes permissions, data retention, and automated risk.
 - Chrome-reviewable: the full behavior must be understandable from the packaged extension code and disclosed product behavior.
@@ -111,7 +117,7 @@ Miru combines three capabilities in one product:
 
 1. User opens a target website in Chrome.
 2. User opens the Miru extension UI.
-3. User enters a task prompt or starts a capture session.
+3. User enters a task prompt in chat.
 4. Miru collects:
    - URL
    - title
@@ -124,12 +130,13 @@ Miru combines three capabilities in one product:
    - workflow refinement suggestion
    - request for more context
    - failure explanation
-7. Miru shows the proposed command and confidence.
+7. Miru renders a readable assistant response, including thinking state, next command, and confidence.
 8. User approves or Miru auto-runs based on the selected mode.
 9. Miru executes the command on the page.
-10. Miru refreshes context, appends the result to the workflow timeline, and repeats until the task completes or the user stops it.
+10. Miru refreshes context, appends the result to the chat and workflow timeline, and repeats until the task completes or the user stops it.
 11. User refines the command stream if needed.
 12. User saves the resulting workflow as a reusable routine for future extraction runs.
+13. If the session was recorded, user exports it as executable JavaScript scaffolding.
 
 ## 10. Product Workflow Model
 
@@ -218,6 +225,7 @@ Miru should:
 Miru must:
 
 - show the current command stream in execution order
+- keep a readable chat transcript alongside the command stream
 - let the user review the result of each command
 - allow a later planner step to refine the workflow based on earlier results
 - make it clear when a command was added, changed, skipped, or failed
@@ -248,6 +256,7 @@ Miru must:
 - allow a successful workflow session to be saved as a reusable routine
 - preserve the ordered command stream and prompt context for reruns
 - support rerunning the routine against the same target site pattern
+- support creating a routine from a recorded chat session
 
 Miru should:
 
@@ -264,7 +273,10 @@ Miru must:
 - show the latest DOM summary
 - show the next planned command
 - show the workflow timeline
+- show readable assistant responses for each planned or executed step
 - let the user stop a running task
+- let the user start or stop recording a session
+- let the user export a recorded session as JavaScript
 
 ### 12.8 Storage and Session Behavior
 
@@ -312,14 +324,15 @@ Miru should:
 
 The extension UI should include:
 
-- current tab summary
-- screenshot preview state
-- task prompt input
-- workflow timeline
-- current command list
+- chat transcript
+- fixed composer with task prompt input
+- mode selector attached to the composer
+- recording affordance
+- workflow timeline or expandable step view
 - action approval controls
-- extraction result panel
+- extraction result view
 - saved-routine affordance
+- export JavaScript affordance
 - error and permission states
 
 The UX should make these states obvious:
@@ -337,6 +350,7 @@ The UX should make this mental model obvious:
 
 - exploration becomes workflow
 - workflow becomes reusable routine
+- conversation becomes executable script
 
 ## 15. Success Metrics
 

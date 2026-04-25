@@ -1,6 +1,16 @@
 export type MiruMode = "auto" | "ask" | "interactive";
 
 export type ActionRisk = "low" | "medium" | "high";
+export type WorkflowStepStatus =
+  | "planned"
+  | "approved"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "repaired"
+  | "skipped";
+export type ChatRole = "user" | "assistant" | "system";
+export type ChatMessageStatus = "ready" | "thinking" | "running" | "complete" | "error";
 
 export interface ElementSummary {
   selector: string;
@@ -42,12 +52,46 @@ export interface PlannerEvent {
   createdAt: number;
 }
 
+export interface WorkflowStep {
+  id: string;
+  action: MiruAction;
+  title: string;
+  rationale?: string;
+  status: WorkflowStepStatus;
+  resultSummary?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+  status: ChatMessageStatus;
+  createdAt: number;
+  relatedStepId?: string;
+}
+
+export interface SavedRoutine {
+  id: string;
+  name: string;
+  originPattern: string;
+  prompt: string;
+  workflowSteps: WorkflowStep[];
+  version: number;
+  lastSuccessfulRunAt?: number;
+  lastRepairAt?: number;
+}
+
 export interface PlanRequest {
   sessionId?: string;
   prompt: string;
   mode: MiruMode;
   context: PageContext;
   history?: PlannerEvent[];
+  chatMessages?: ChatMessage[];
+  workflowSteps?: WorkflowStep[];
+  routine?: SavedRoutine;
 }
 
 export interface ProposedAction {
@@ -67,6 +111,42 @@ export interface PlanResponse {
     storedInSupabase: boolean;
   };
 }
+
+export type PlanStreamEvent =
+  | {
+      event: "assistant_message_start";
+      data: {
+        messageId: string;
+        createdAt: number;
+      };
+    }
+  | {
+      event: "assistant_token";
+      data: {
+        messageId: string;
+        token: string;
+        createdAt: number;
+      };
+    }
+  | {
+      event: "assistant_message_done";
+      data: {
+        messageId: string;
+        createdAt: number;
+      };
+    }
+  | {
+      event: "assistant_message_error";
+      data: {
+        messageId: string;
+        error: string;
+        createdAt: number;
+      };
+    }
+  | {
+      event: "plan_result";
+      data: PlanResponse;
+    };
 
 export interface PersistedPlan {
   sessionId: string;

@@ -197,6 +197,32 @@ function buildPlannerMessages(request: PlanRequest) {
   ];
 }
 
+function buildStreamingNarrationMessages(request: PlanRequest) {
+  return [
+    {
+      role: "system" as const,
+      content: [
+        "You are Miru, an AI-native browser crawler copilot.",
+        "Write a concise live narration while you plan a single next command.",
+        "Keep it actionable, technical, and short.",
+        "Do not output JSON, markdown code blocks, or final command objects.",
+        "Speak in first person as Miru and keep total output under 70 words.",
+      ].join(" "),
+    },
+    {
+      role: "user" as const,
+      content: JSON.stringify({
+        mode: request.mode,
+        prompt: request.prompt,
+        url: request.context.url,
+        title: request.context.title,
+        visibleTextLength: request.context.visibleTextLength,
+        interactiveElements: request.context.interactiveElements.slice(0, 18),
+      }),
+    },
+  ];
+}
+
 function coerceConfidence(value: number): number {
   if (Number.isNaN(value)) {
     return 0.5;
@@ -332,5 +358,33 @@ export async function planNextAction(request: PlanRequest): Promise<ProposedActi
   } catch (error) {
     console.error("[Miru] Groq planner failed, using fallback plan:", error);
     return buildFallbackPlan(request);
+  }
+}
+
+export async function streamPlanNarration(
+  request: PlanRequest,
+  onToken: (token: string) => Promise<void> | void
+): Promise<void> {
+  if (!groq) {
+    throw new Error("GROQ_API_KEY is missing. Add it to backend/.env before starting the backend.");
+  }
+
+  try {
+    const stream = await groq.chat.completions.create({
+      model: config.groqModel,
+      messages: buildStreamingNarrationMessages(request),
+      temperature: 0.35,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const token = chunk.choices[0]?.delta?.content;
+      if (typeof token === "string" && token.length > 0) {
+        await onToken(token);
+      }
+    }
+  } catch (error) {
+    console.error("[Miru] Groq narration stream failed:", error);
+    await onToken("I am preparing the safest next command from the current page context.");
   }
 }

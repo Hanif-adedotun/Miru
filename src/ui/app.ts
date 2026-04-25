@@ -1,37 +1,59 @@
 import { DEFAULT_PROMPT } from "../shared/constants.js";
 import type {
+  ChatMessage,
+  ExportScriptResponseMessage,
   MiruAction,
   MiruMode,
+  PlannerStreamEvent,
   SessionResponseMessage,
   SessionState,
+  SessionStreamEventMessage,
+  WorkflowStep,
 } from "../shared/types.js";
 
-const modeMeta: Record<
-  MiruMode,
-  { label: string; detail: string }
-> = {
+const modeMeta: Record<MiruMode, { label: string; detail: string }> = {
   auto: {
-    label: "Auto run",
-    detail: "Runs low and medium risk steps automatically. High-risk steps still pause.",
+    label: "Auto",
+    detail: "Runs safe steps continuously.",
   },
   ask: {
-    label: "Ask mode",
-    detail: "Runs safe read-only steps automatically and asks before actions that change the page.",
+    label: "Ask",
+    detail: "Asks before page-changing steps.",
   },
   interactive: {
     label: "Interactive",
-    detail: "Pauses on every proposed step so you can review the plan one action at a time.",
+    detail: "Stops on every step.",
   },
 };
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function formatTime(timestamp?: number): string {
+  if (!timestamp) {
+    return "";
+  }
+
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 function formatAction(action?: MiruAction): string {
   if (!action) {
-    return "No action planned yet.";
+    return "Waiting for the next command";
   }
 
   switch (action.type) {
     case "QUERY":
-      return `Query ${action.selector}`;
+      return `Inspect ${action.selector}`;
     case "CLICK":
       return `Click ${action.selector}`;
     case "TYPE":
@@ -45,28 +67,20 @@ function formatAction(action?: MiruAction): string {
     case "STOP":
       return `Stop: ${action.reason}`;
     default:
-      return "Unknown action";
+      return "Unknown command";
   }
 }
 
-function formatTime(timestamp?: number): string {
-  if (!timestamp) {
-    return "Not captured yet";
+function summarizeResult(value: unknown): string {
+  if (value === undefined || value === null) {
+    return "No result yet.";
   }
 
-  return new Date(timestamp).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
+  if (typeof value === "string") {
+    return value;
+  }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+  return JSON.stringify(value);
 }
 
 function renderModeChips(selectedMode: MiruMode): string {
@@ -74,195 +88,189 @@ function renderModeChips(selectedMode: MiruMode): string {
     .map((mode) => {
       const meta = modeMeta[mode];
       return `
-        <button class="mode-chip ${selectedMode === mode ? "is-active" : ""}" type="button" data-mode="${mode}">
+        <button class="mode-chip ${selectedMode === mode ? "is-active" : ""}" type="button" data-mode="${mode}" title="${escapeHtml(meta.detail)}">
           <span class="mode-chip-label">${meta.label}</span>
-          <span class="mode-chip-detail">${meta.detail}</span>
         </button>
       `;
     })
     .join("");
 }
 
-function renderApp(state: SessionState): string {
-  const mode = state.mode || "interactive";
-  const context = state.currentContext;
-  const pendingAction = state.pendingAction;
-  const metricsMarkup = context
-    ? `
-          <div class="metric-grid">
-            <div class="metric-card">
-              <span>Visible text</span>
-              <strong>${context.visibleTextLength}</strong>
-            </div>
-            <div class="metric-card">
-              <span>Links</span>
-              <strong>${context.linkCount}</strong>
-            </div>
-            <div class="metric-card">
-              <span>Forms</span>
-              <strong>${context.formCount}</strong>
-            </div>
-            <div class="metric-card">
-              <span>Targets</span>
-              <strong>${context.interactiveElements.length}</strong>
-            </div>
-          </div>
-      `
-    : `
-          <div class="empty-state-card">
-            <p class="empty-state-title">No page context yet</p>
-            <p class="empty-state-copy">
-              Start a session when you're on a page you want Miru to inspect. The live metrics, screenshot,
-              and HTML preview will appear here once capture runs.
-            </p>
-          </div>
-      `;
-  const events = state.history
-    .slice()
-    .reverse()
+function renderWorkflowSteps(steps: WorkflowStep[] | undefined): string {
+  const items = (steps ?? []).slice(-4);
+  if (items.length === 0) {
+    return `<div class="workflow-empty">Commands will appear here as Miru builds the session.</div>`;
+  }
+
+  return items
     .map(
-      (event) => `
-        <article class="timeline-item timeline-${event.status}">
-          <div class="timeline-copy">
-            <p class="timeline-title">${escapeHtml(event.title)}</p>
-            <p class="timeline-detail">${escapeHtml(event.detail)}</p>
+      (step) => `
+        <article class="workflow-step">
+          <div class="workflow-step-main">
+            <p class="workflow-step-title">${escapeHtml(step.title || formatAction(step.action))}</p>
+            <p class="workflow-step-copy">${escapeHtml(step.resultSummary || step.rationale || "Waiting for result")}</p>
           </div>
-          <time class="timeline-time">${formatTime(event.createdAt)}</time>
+          <div class="workflow-step-meta">
+            <span class="workflow-step-status">${escapeHtml(step.status)}</span>
+            <time>${formatTime(step.updatedAt)}</time>
+          </div>
         </article>
       `
     )
     .join("");
+}
+
+function defaultMessages(state: SessionState): ChatMessage[] {
+  const fallback: ChatMessage[] = [];
+
+  if (state.pendingAction) {
+    fallback.push({
+      id: state.pendingAction.id,
+      role: "assistant",
+      content: `Next command: ${formatAction(state.pendingAction.action)}. ${state.pendingAction.rationale}`,
+      status: "complete",
+      createdAt: state.updatedAt,
+      relatedStepId: state.pendingAction.id,
+    });
+  }
+
+  if (state.lastResult) {
+    fallback.push({
+      id: `result-${state.updatedAt}`,
+      role: "assistant",
+      content: `Result: ${summarizeResult(state.lastResult.result ?? state.lastResult.error)}`,
+      status: state.lastResult.success ? "complete" : "error",
+      createdAt: state.updatedAt,
+    });
+  }
+
+  if (fallback.length === 0) {
+    fallback.push({
+      id: "assistant-welcome",
+      role: "assistant",
+      content:
+        "Describe the crawl you want. Miru will think in chat, act on the page, and can record the session as JavaScript.",
+      status: "complete",
+      createdAt: Date.now(),
+    });
+  }
+
+  return fallback;
+}
+
+function renderMessages(state: SessionState): string {
+  const messages = (state.chatMessages && state.chatMessages.length > 0 ? state.chatMessages : defaultMessages(state)).slice(-14);
+
+  return messages
+    .map((message) => {
+      const roleClass = `message-${message.role}`;
+      const statusText =
+        message.status === "thinking"
+          ? "Thinking"
+          : message.status === "running"
+          ? "Running"
+          : message.status === "error"
+          ? "Error"
+          : "";
+
+      return `
+        <article class="message-row ${roleClass}">
+          <div class="message-bubble">
+            <div class="message-head">
+              <span class="message-role">${escapeHtml(message.role === "assistant" ? "Miru" : message.role === "user" ? "You" : "System")}</span>
+              <span class="message-time">${formatTime(message.createdAt)}</span>
+            </div>
+            <p class="message-copy ${message.status === "thinking" ? "is-streaming" : ""}">${escapeHtml(message.content)}</p>
+            ${statusText ? `<div class="message-status">${statusText}</div>` : ""}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderApp(state: SessionState, hasStreamedResponse: boolean): string {
+  const mode = state.mode || "interactive";
+  const pendingAction = state.pendingAction;
+  const workflowCount = (state.workflowSteps ?? []).length;
+  const routineSummary = state.recordedSession
+    ? `${state.recordedSession.workflowSteps.length} recorded step${state.recordedSession.workflowSteps.length === 1 ? "" : "s"}`
+    : "Not recording";
+  const shellClass = hasStreamedResponse ? "has-streamed-response" : "is-input-centered";
 
   return `
-    <div class="shell shell-sidepanel">
-      <div class="ambient ambient-one"></div>
-      <div class="ambient ambient-two"></div>
-
-      <section class="hero glass-panel">
-        <div class="hero-topline">
-          <span class="badge">Miru V1</span>
-          <span class="badge muted">Side panel session</span>
+    <div class="chat-shell ${shellClass}">
+      <header class="chat-header glass-shell">
+        <div>
+          <p class="brand-mark">Miru</p>
+          <h1>Chat-first crawler studio</h1>
         </div>
-        <div class="hero-copy">
-          <h1>Visual browser automation for developers.</h1>
-          <p>
-            Miru builds context from the live page, the visible screenshot, and the HTML summary before it
-            chooses the next step.
-          </p>
+        <div class="header-meta">
+          <span class="status-pill status-${state.status}">${state.status}</span>
+        </div>
+      </header>
+
+      <section class="chat-main">
+        <div class="chat-thread glass-shell">
+          <div class="thread-scroll">
+            ${renderMessages(state)}
+          </div>
         </div>
       </section>
 
-      <section class="glass-panel compose-panel">
-        <div class="panel-header">
-          <div>
-            <p class="eyebrow">Session prompt</p>
-            <h2>Start or continue a Miru run</h2>
+      <footer class="composer glass-shell">
+        <div class="composer-top surface-card">
+          <div class="mode-row">
+            <span class="sidebar-label inline-label">Mode</span>
+            ${renderModeChips(mode)}
           </div>
-          <span class="status-pill status-${state.status}">${state.status}</span>
+          <div class="composer-actions compact-actions">
+            <button id="recordBtnInline" class="ghost-button compact" type="button">${state.isRecording ? "Stop rec" : "Record"}</button>
+            <button id="refreshBtn" class="ghost-button compact" type="button">Refresh memory</button>
+          </div>
         </div>
-
-        <label class="field">
-          <span>Task prompt</span>
-          <textarea id="promptInput" rows="5" placeholder="Tell Miru what to inspect or do.">${escapeHtml(
+        <label class="composer-field">
+          <textarea id="promptInput" rows="3" placeholder="Tell Miru what to crawl, extract, or test next...">${escapeHtml(
             state.prompt || DEFAULT_PROMPT
           )}</textarea>
         </label>
-
-        <div class="mode-grid">
-          ${renderModeChips(mode)}
+        <div class="composer-bottom surface-card">
+          <div class="live-session-meta">
+            <p class="composer-hint">${escapeHtml(
+              pendingAction?.rationale ||
+                "Conversation becomes workflow, workflow becomes reusable JavaScript."
+            )}</p>
+            <div class="sidebar-meta">
+              <span>${pendingAction ? `${Math.round(pendingAction.confidence * 100)}% confidence` : "Waiting for first plan"}</span>
+              <span>${pendingAction?.requiresConfirmation ? "Needs approval" : "Can continue"}</span>
+              <span>${workflowCount} step${workflowCount === 1 ? "" : "s"}</span>
+              <span>${escapeHtml(routineSummary)}</span>
+            </div>
+          </div>
+          <div class="composer-actions">
+            <button id="planBtn" class="secondary-button" type="button">Refine</button>
+            <button id="approveBtn" class="secondary-button" type="button" ${pendingAction ? "" : "disabled"}>Approve</button>
+            <button id="exportBtn" class="secondary-button" type="button" ${(state.workflowSteps ?? []).length > 0 ? "" : "disabled"}>Export JS</button>
+            <button id="resetBtn" class="ghost-button" type="button">Reset</button>
+            <button id="startBtn" class="primary-button" type="button">Send</button>
+          </div>
         </div>
-
-        <div class="action-row">
-          <button id="startBtn" class="primary-button" type="button">Start session</button>
-          <button id="planBtn" class="secondary-button" type="button">Plan next step</button>
-          <button id="approveBtn" class="secondary-button" type="button" ${
-            pendingAction ? "" : "disabled"
-          }>Approve and run</button>
-          <button id="stopBtn" class="ghost-button" type="button">End session</button>
+        <details class="workflow-drawer">
+          <summary>Recent workflow steps</summary>
+          <div class="workflow-list">
+            ${renderWorkflowSteps(state.workflowSteps)}
+          </div>
+        </details>
+        <div class="composer-top mobile-header-meta">
+          <div class="mode-row">
+            <span class="sidebar-label inline-label">Status</span>
+            <span class="status-pill status-${state.status}">${state.status}</span>
+          </div>
+          <div class="composer-actions compact-actions">
+            <button id="recordBtnMobile" class="ghost-button compact" type="button">${state.isRecording ? "Stop rec" : "Record"}</button>
+          </div>
         </div>
-      </section>
-
-      <section class="grid">
-        <article class="glass-panel metrics-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Current page</p>
-              <h2>${escapeHtml(context?.title || "Waiting for first capture")}</h2>
-            </div>
-            <span class="tiny-copy">${context ? `Captured ${formatTime(context.timestamp)}` : "Session memory is empty"}</span>
-          </div>
-
-          ${metricsMarkup}
-
-          <div class="context-url">${escapeHtml(context?.url || "Open a target page, then start or refresh a session to load context.")}</div>
-
-          <div class="context-html">
-            <p class="eyebrow">HTML preview</p>
-            <pre>${escapeHtml(context?.htmlPreview || "Miru stores the latest screenshot and DOM summary only for the active session.")}</pre>
-          </div>
-        </article>
-
-        <article class="glass-panel screenshot-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Visible screenshot</p>
-              <h2>Session-only visual memory</h2>
-            </div>
-            <span class="tiny-copy">Deleted when the session ends</span>
-          </div>
-
-          ${
-            context?.screenshotDataUrl
-              ? `<img class="screenshot-preview" src="${context.screenshotDataUrl}" alt="Current page screenshot">`
-              : `<div class="screenshot-empty">Miru captures the visible tab only after you start or refresh a session.</div>`
-          }
-        </article>
-      </section>
-
-      <section class="grid grid-bottom">
-        <article class="glass-panel action-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Next step</p>
-              <h2>${escapeHtml(formatAction(pendingAction?.action))}</h2>
-            </div>
-            <span class="risk-pill risk-${pendingAction?.risk || "low"}">${pendingAction?.risk || "low"} risk</span>
-          </div>
-
-          <p class="action-rationale">${escapeHtml(
-            pendingAction?.rationale || "Miru will propose the next action after it captures the current tab context."
-          )}</p>
-
-          <div class="meta-row">
-            <span>Confidence ${pendingAction ? Math.round(pendingAction.confidence * 100) : 0}%</span>
-            <span>${pendingAction?.requiresConfirmation ? "Requires confirmation" : "Can run automatically"}</span>
-          </div>
-
-          <div class="result-card ${state.lastResult?.success ? "is-success" : state.lastError ? "is-error" : ""}">
-            <p class="eyebrow">Latest result</p>
-            <pre>${escapeHtml(
-              JSON.stringify(state.lastResult?.result ?? state.lastError ?? "No action has been run yet.", null, 2)
-            )}</pre>
-          </div>
-        </article>
-
-        <article class="glass-panel timeline-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Timeline</p>
-              <h2>Session events</h2>
-            </div>
-            <span class="tiny-copy">${state.history.length} entries</span>
-          </div>
-
-          <div class="timeline-list">
-            ${
-              events ||
-              '<div class="timeline-empty">Miru will log context capture, plan decisions, approvals, and execution results here.</div>'
-            }
-          </div>
-        </article>
-      </section>
+      </footer>
     </div>
   `;
 }
@@ -272,19 +280,111 @@ async function sendRuntimeMessage(type: string, payload?: unknown): Promise<Sess
   return response.payload;
 }
 
+async function exportRecordedScript(): Promise<{ filename: string; script: string }> {
+  const response = (await chrome.runtime.sendMessage({ type: "EXPORT_SESSION_SCRIPT" })) as ExportScriptResponseMessage;
+  return response.payload;
+}
+
+function downloadTextFile(filename: string, script: string): void {
+  const blob = new Blob([script], { type: "text/javascript;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function applyStreamEvent(state: SessionState, event: PlannerStreamEvent): SessionState {
+  const currentMessages = [...(state.chatMessages ?? [])];
+  const getIndex = (messageId: string): number => currentMessages.findIndex((item) => item.id === messageId);
+
+  if (event.type === "assistant_message_start") {
+    const idx = getIndex(event.messageId);
+    if (idx === -1) {
+      currentMessages.push({
+        id: event.messageId,
+        role: "assistant",
+        content: "",
+        status: "thinking",
+        createdAt: event.createdAt,
+      });
+    }
+    return { ...state, chatMessages: currentMessages.slice(-30) };
+  }
+
+  if (event.type === "assistant_token") {
+    const idx = getIndex(event.messageId);
+    if (idx === -1) {
+      currentMessages.push({
+        id: event.messageId,
+        role: "assistant",
+        content: event.token,
+        status: "thinking",
+        createdAt: event.createdAt,
+      });
+    } else {
+      currentMessages[idx] = {
+        ...currentMessages[idx],
+        content: `${currentMessages[idx].content}${event.token}`,
+        status: "thinking",
+      };
+    }
+    return { ...state, chatMessages: currentMessages.slice(-30) };
+  }
+
+  if (event.type === "assistant_message_done") {
+    const idx = getIndex(event.messageId);
+    if (idx >= 0) {
+      currentMessages[idx] = {
+        ...currentMessages[idx],
+        status: "complete",
+      };
+    }
+    return { ...state, chatMessages: currentMessages.slice(-30) };
+  }
+
+  const idx = getIndex(event.messageId);
+  if (idx >= 0) {
+    currentMessages[idx] = {
+      ...currentMessages[idx],
+      status: "error",
+      content: `${currentMessages[idx].content}\n${event.error}`,
+    };
+  } else {
+    currentMessages.push({
+      id: event.messageId,
+      role: "assistant",
+      content: event.error,
+      status: "error",
+      createdAt: event.createdAt,
+    });
+  }
+
+  return { ...state, chatMessages: currentMessages.slice(-30) };
+}
+
 export function initMiruApp(root: HTMLElement): void {
   let selectedMode: MiruMode = "interactive";
+  let hasStreamedResponse = false;
   let state: SessionState = {
     id: null,
     mode: "interactive",
     prompt: DEFAULT_PROMPT,
     status: "idle",
     history: [],
+    workflowSteps: [],
+    chatMessages: [],
+    isRecording: false,
     updatedAt: Date.now(),
   };
 
   const render = (): void => {
-    root.innerHTML = renderApp({ ...state, mode: selectedMode || state.mode });
+    root.innerHTML = renderApp({ ...state, mode: selectedMode || state.mode }, hasStreamedResponse);
+    const thread = root.querySelector<HTMLElement>(".thread-scroll");
+    if (thread) {
+      thread.scrollTop = thread.scrollHeight;
+    }
 
     root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -303,12 +403,6 @@ export function initMiruApp(root: HTMLElement): void {
       render();
     });
 
-    root.querySelector<HTMLButtonElement>("#refreshBtn")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("REFRESH_CONTEXT");
-      selectedMode = state.mode;
-      render();
-    });
-
     root.querySelector<HTMLButtonElement>("#planBtn")?.addEventListener("click", async () => {
       state = await sendRuntimeMessage("PLAN_NEXT_ACTION");
       selectedMode = state.mode;
@@ -321,7 +415,31 @@ export function initMiruApp(root: HTMLElement): void {
       render();
     });
 
-    root.querySelector<HTMLButtonElement>("#stopBtn")?.addEventListener("click", async () => {
+    root.querySelector<HTMLButtonElement>("#refreshBtn")?.addEventListener("click", async () => {
+      state = await sendRuntimeMessage("REFRESH_CONTEXT");
+      selectedMode = state.mode;
+      render();
+    });
+
+    root.querySelector<HTMLButtonElement>("#recordBtnInline")?.addEventListener("click", async () => {
+      state = await sendRuntimeMessage("TOGGLE_RECORDING");
+      selectedMode = state.mode;
+      render();
+    });
+    root.querySelector<HTMLButtonElement>("#recordBtnMobile")?.addEventListener("click", async () => {
+      state = await sendRuntimeMessage("TOGGLE_RECORDING");
+      selectedMode = state.mode;
+      render();
+    });
+
+    root.querySelector<HTMLButtonElement>("#exportBtn")?.addEventListener("click", async () => {
+      const exported = await exportRecordedScript();
+      downloadTextFile(exported.filename, exported.script);
+      state = await sendRuntimeMessage("GET_SESSION");
+      render();
+    });
+
+    root.querySelector<HTMLButtonElement>("#resetBtn")?.addEventListener("click", async () => {
       state = await sendRuntimeMessage("STOP_SESSION");
       selectedMode = state.mode;
       render();
@@ -329,8 +447,24 @@ export function initMiruApp(root: HTMLElement): void {
   };
 
   const boot = async (): Promise<void> => {
+    const streamPort = chrome.runtime.connect({ name: "miru-session-stream" });
+    streamPort.onMessage.addListener((message: SessionStreamEventMessage) => {
+      if (!message || message.type !== "SESSION_STREAM_EVENT" || !message.payload) {
+        return;
+      }
+
+      state = applyStreamEvent(state, message.payload);
+      if (message.payload.type === "assistant_token") {
+        hasStreamedResponse = true;
+      }
+      render();
+    });
+
     state = await sendRuntimeMessage("GET_SESSION");
     selectedMode = state.mode;
+    hasStreamedResponse = (state.chatMessages ?? []).some(
+      (message) => message.role === "assistant" && message.content.trim().length > 0
+    );
     render();
   };
 

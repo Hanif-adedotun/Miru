@@ -17,6 +17,16 @@ export type SessionStatus =
 export type ActionRisk = "low" | "medium" | "high";
 
 export type EventStatus = "info" | "success" | "warning" | "error";
+export type WorkflowStepStatus =
+  | "planned"
+  | "approved"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "repaired"
+  | "skipped";
+export type ChatRole = "user" | "assistant" | "system";
+export type ChatMessageStatus = "ready" | "thinking" | "running" | "complete" | "error";
 
 export interface ElementSummary {
   selector: string;
@@ -75,6 +85,46 @@ export interface SessionEvent {
   createdAt: number;
 }
 
+export interface WorkflowStep {
+  id: string;
+  action: MiruAction;
+  title: string;
+  rationale?: string;
+  status: WorkflowStepStatus;
+  resultSummary?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SavedRoutine {
+  id: string;
+  name: string;
+  originPattern: string;
+  prompt: string;
+  workflowSteps: WorkflowStep[];
+  version: number;
+  lastSuccessfulRunAt?: number;
+  lastRepairAt?: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+  status: ChatMessageStatus;
+  createdAt: number;
+  relatedStepId?: string;
+}
+
+export interface RecordedSession {
+  id: string;
+  prompt: string;
+  mode: MiruMode;
+  workflowSteps: WorkflowStep[];
+  startedAt: number;
+  completedAt?: number;
+}
+
 export interface SessionState {
   id: string | null;
   mode: MiruMode;
@@ -86,6 +136,12 @@ export interface SessionState {
   pendingAction?: ProposedAction;
   lastResult?: ActionResultPayload;
   history: SessionEvent[];
+  workflowSteps?: WorkflowStep[];
+  chatMessages?: ChatMessage[];
+  isRecording?: boolean;
+  recordedSession?: RecordedSession;
+  lastExportedScript?: string;
+  activeRoutine?: SavedRoutine;
   lastError?: string;
   createdAt?: number;
   updatedAt: number;
@@ -103,6 +159,9 @@ export interface PlannerRequest {
   mode: MiruMode;
   context: PageContext;
   history?: PlannerEvent[];
+  chatMessages?: ChatMessage[];
+  workflowSteps?: WorkflowStep[];
+  routine?: SavedRoutine;
 }
 
 export interface PlannerResponse {
@@ -114,6 +173,31 @@ export interface PlannerResponse {
   };
 }
 
+export type PlannerStreamEvent =
+  | {
+      type: "assistant_message_start";
+      messageId: string;
+      sessionId?: string;
+      createdAt: number;
+    }
+  | {
+      type: "assistant_token";
+      messageId: string;
+      token: string;
+      createdAt: number;
+    }
+  | {
+      type: "assistant_message_done";
+      messageId: string;
+      createdAt: number;
+    }
+  | {
+      type: "assistant_message_error";
+      messageId: string;
+      error: string;
+      createdAt: number;
+    };
+
 export type MessageType =
   | "PING"
   | "PONG"
@@ -124,8 +208,13 @@ export type MessageType =
   | "PLAN_NEXT_ACTION"
   | "APPROVE_PENDING_ACTION"
   | "REFRESH_CONTEXT"
+  | "TOGGLE_RECORDING"
+  | "EXPORT_SESSION_SCRIPT"
   | "STOP_SESSION"
+  | "SUBSCRIBE_SESSION_STREAM"
+  | "SESSION_STREAM_EVENT"
   | "SESSION_RESPONSE"
+  | "EXPORT_SCRIPT_RESPONSE"
   | "ACTION_RESULT"
   | "ERROR";
 
@@ -146,9 +235,22 @@ export interface SessionResponseMessage extends Message {
   payload: SessionState;
 }
 
+export interface SessionStreamEventMessage extends Message {
+  type: "SESSION_STREAM_EVENT";
+  payload: PlannerStreamEvent;
+}
+
 export interface ExecuteActionMessage extends Message {
   type: "EXECUTE_ACTION";
   payload: MiruAction;
+}
+
+export interface ExportScriptResponseMessage extends Message {
+  type: "EXPORT_SCRIPT_RESPONSE";
+  payload: {
+    filename: string;
+    script: string;
+  };
 }
 
 export interface ActionResultMessage extends Message {

@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 
-import { planNextAction } from "./planner.js";
+import { planNextAction, streamPlanNarration } from "./planner.js";
 import { registerRoutes } from "./routes.js";
 import { createStorageAdapter, type StorageAdapter } from "./storage.js";
 import type { PlanRequest, ProposedAction } from "./types.js";
@@ -9,6 +9,7 @@ declare module "fastify" {
   interface FastifyInstance {
     planner: {
       plan(request: PlanRequest): Promise<ProposedAction>;
+      streamNarration(request: PlanRequest, onToken: (token: string) => Promise<void> | void): Promise<void>;
     };
     storage: StorageAdapter;
   }
@@ -32,6 +33,7 @@ export async function buildApp() {
 
   app.decorate("planner", {
     plan: planNextAction,
+    streamNarration: streamPlanNarration,
   });
 
   app.decorate("storage", createStorageAdapter());

@@ -1,30 +1,16 @@
 import { DEFAULT_PROMPT } from "../shared/constants.js";
 import type {
   ChatMessage,
-  ExportScriptResponseMessage,
   MiruAction,
   MiruMode,
   PlannerStreamEvent,
   SessionResponseMessage,
   SessionState,
   SessionStreamEventMessage,
-  WorkflowStep,
 } from "../shared/types.js";
+import { downloadArtifactsCsv, downloadArtifactsPdf, exportBaseFilename } from "./exportDownloads.js";
 
-const modeMeta: Record<MiruMode, { label: string; detail: string }> = {
-  auto: {
-    label: "Auto",
-    detail: "Runs safe steps continuously.",
-  },
-  ask: {
-    label: "Ask",
-    detail: "Asks before page-changing steps.",
-  },
-  interactive: {
-    label: "Interactive",
-    detail: "Stops on every step.",
-  },
-};
+const MODE_OPTIONS = ["auto", "ask"] as const satisfies readonly MiruMode[];
 
 function escapeHtml(value: string): string {
   return value
@@ -33,17 +19,6 @@ function escapeHtml(value: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
-}
-
-function formatTime(timestamp?: number): string {
-  if (!timestamp) {
-    return "";
-  }
-
-  return new Date(timestamp).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
 }
 
 function formatAction(action?: MiruAction): string {
@@ -64,6 +39,8 @@ function formatAction(action?: MiruAction): string {
       return `Wait ${action.durationMs}ms`;
     case "EXTRACT":
       return `Extract ${action.fields.map((field) => field.name).join(", ")}`;
+    case "EXTRACT_LIST":
+      return `Extract list ${action.itemSelector} (${action.fields.map((field) => field.name).join(", ")})`;
     case "STOP":
       return `Stop: ${action.reason}`;
     default:
@@ -83,56 +60,20 @@ function summarizeResult(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function renderModeChips(selectedMode: MiruMode): string {
-  return (Object.keys(modeMeta) as MiruMode[])
-    .map((mode) => {
-      const meta = modeMeta[mode];
-      return `
-        <button class="mode-chip ${selectedMode === mode ? "is-active" : ""}" type="button" data-mode="${mode}" title="${escapeHtml(meta.detail)}">
-          <span class="mode-chip-label">${meta.label}</span>
-        </button>
-      `;
-    })
-    .join("");
-}
+const iconAuto = `<svg class="mode-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>`;
+const iconAsk = `<svg class="mode-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5l6.5 9-6.5 9-6.5-9 6.5-9z"/></svg>`;
 
-function renderWorkflowSteps(steps: WorkflowStep[] | undefined): string {
-  const items = (steps ?? []).slice(-4);
-  if (items.length === 0) {
-    return `<div class="workflow-empty">Commands will appear here as Miru builds the session.</div>`;
-  }
-
-  return items
-    .map(
-      (step) => `
-        <article class="workflow-step">
-          <div class="workflow-step-main">
-            <p class="workflow-step-title">${escapeHtml(step.title || formatAction(step.action))}</p>
-            <p class="workflow-step-copy">${escapeHtml(step.resultSummary || step.rationale || "Waiting for result")}</p>
-          </div>
-          <div class="workflow-step-meta">
-            <span class="workflow-step-status">${escapeHtml(step.status)}</span>
-            <time>${formatTime(step.updatedAt)}</time>
-          </div>
-        </article>
-      `
-    )
-    .join("");
+function renderModePill(selectedMode: MiruMode): string {
+  return MODE_OPTIONS.map((mode) => {
+    const label = mode === "auto" ? "Auto" : "Ask";
+    const active = selectedMode === mode;
+    const icon = mode === "auto" ? iconAuto : iconAsk;
+    return `<button type="button" class="mode-bubble ${active ? "is-active" : ""}" data-mode="${mode}">${icon}<span class="mode-bubble-label">${label}</span></button>`;
+  }).join("");
 }
 
 function defaultMessages(state: SessionState): ChatMessage[] {
   const fallback: ChatMessage[] = [];
-
-  if (state.pendingAction) {
-    fallback.push({
-      id: state.pendingAction.id,
-      role: "assistant",
-      content: `Next command: ${formatAction(state.pendingAction.action)}. ${state.pendingAction.rationale}`,
-      status: "complete",
-      createdAt: state.updatedAt,
-      relatedStepId: state.pendingAction.id,
-    });
-  }
 
   if (state.lastResult) {
     fallback.push({
@@ -148,8 +89,7 @@ function defaultMessages(state: SessionState): ChatMessage[] {
     fallback.push({
       id: "assistant-welcome",
       role: "assistant",
-      content:
-        "Describe the crawl you want. Miru will think in chat, act on the page, and can record the session as JavaScript.",
+      content: "What should I do on this page?",
       status: "complete",
       createdAt: Date.now(),
     });
@@ -159,7 +99,9 @@ function defaultMessages(state: SessionState): ChatMessage[] {
 }
 
 function renderMessages(state: SessionState): string {
-  const messages = (state.chatMessages && state.chatMessages.length > 0 ? state.chatMessages : defaultMessages(state)).slice(-14);
+  const messages = (state.chatMessages && state.chatMessages.length > 0 ? state.chatMessages : defaultMessages(state)).slice(
+    -40
+  );
 
   return messages
     .map((message) => {
@@ -168,20 +110,18 @@ function renderMessages(state: SessionState): string {
         message.status === "thinking"
           ? "Thinking"
           : message.status === "running"
-          ? "Running"
-          : message.status === "error"
-          ? "Error"
-          : "";
+            ? "Running"
+            : message.status === "error"
+              ? "Error"
+              : "";
+
+      const errorClass = message.status === "error" ? " is-error" : "";
 
       return `
-        <article class="message-row ${roleClass}">
+        <article class="message-row ${roleClass}${errorClass}">
           <div class="message-bubble">
-            <div class="message-head">
-              <span class="message-role">${escapeHtml(message.role === "assistant" ? "Miru" : message.role === "user" ? "You" : "System")}</span>
-              <span class="message-time">${formatTime(message.createdAt)}</span>
-            </div>
             <p class="message-copy ${message.status === "thinking" ? "is-streaming" : ""}">${escapeHtml(message.content)}</p>
-            ${statusText ? `<div class="message-status">${statusText}</div>` : ""}
+            ${statusText ? `<div class="message-status">${escapeHtml(statusText)}</div>` : ""}
           </div>
         </article>
       `;
@@ -189,88 +129,80 @@ function renderMessages(state: SessionState): string {
     .join("");
 }
 
-function renderApp(state: SessionState, hasStreamedResponse: boolean): string {
-  const mode = state.mode || "interactive";
-  const pendingAction = state.pendingAction;
-  const workflowCount = (state.workflowSteps ?? []).length;
-  const routineSummary = state.recordedSession
-    ? `${state.recordedSession.workflowSteps.length} recorded step${state.recordedSession.workflowSteps.length === 1 ? "" : "s"}`
-    : "Not recording";
-  const shellClass = hasStreamedResponse ? "has-streamed-response" : "is-input-centered";
+function textareaValue(_state: SessionState): string {
+  // Composer stays empty; chat history holds user messages (state.prompt is kept for the planner).
+  return "";
+}
+
+function renderStructuredNextStep(state: SessionState): string {
+  const pending = state.pendingAction;
+  if (!pending) {
+    return "";
+  }
+
+  const needsApproval = pending.requiresConfirmation || state.status === "awaiting_approval";
+  const approvalNote = needsApproval
+    ? `<p class="next-step-note">This step needs your approval before it runs.</p>`
+    : "";
 
   return `
-    <div class="chat-shell ${shellClass}">
-      <header class="chat-header glass-shell">
-        <div>
-          <p class="brand-mark">Miru</p>
-          <h1>Chat-first crawler studio</h1>
-        </div>
-        <div class="header-meta">
-          <span class="status-pill status-${state.status}">${state.status}</span>
-        </div>
-      </header>
+    <aside class="next-step-card" aria-label="Structured next command">
+      <div class="next-step-kicker">Next step (what will run)</div>
+      <p class="next-step-command">${escapeHtml(formatAction(pending.action))}</p>
+      <p class="next-step-rationale">${escapeHtml(pending.rationale)}</p>
+      ${approvalNote}
+    </aside>
+  `;
+}
 
-      <section class="chat-main">
-        <div class="chat-thread glass-shell">
-          <div class="thread-scroll">
-            ${renderMessages(state)}
-          </div>
-        </div>
-      </section>
+function renderExportToolbar(state: SessionState): string {
+  const artifacts = state.scrapeArtifacts ?? [];
+  if (artifacts.length === 0) {
+    return "";
+  }
 
-      <footer class="composer glass-shell">
-        <div class="composer-top surface-card">
-          <div class="mode-row">
-            <span class="sidebar-label inline-label">Mode</span>
-            ${renderModeChips(mode)}
-          </div>
-          <div class="composer-actions compact-actions">
-            <button id="recordBtnInline" class="ghost-button compact" type="button">${state.isRecording ? "Stop rec" : "Record"}</button>
-            <button id="refreshBtn" class="ghost-button compact" type="button">Refresh memory</button>
-          </div>
+  const rowCount = artifacts.reduce((total, artifact) => total + artifact.rows.length, 0);
+
+  return `
+    <div class="export-toolbar" role="region" aria-label="Export scrape data">
+      <span class="export-toolbar-meta">${artifacts.length} table(s) · ${rowCount} row(s)</span>
+      <div class="export-toolbar-actions">
+        <button type="button" class="export-btn" id="downloadCsvBtn">Download CSV</button>
+        <button type="button" class="export-btn export-btn-secondary" id="downloadPdfBtn">Download PDF</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderApp(state: SessionState, selectedMode: MiruMode): string {
+  const busy = ["capturing", "planning", "executing"].includes(state.status);
+  const mode = selectedMode;
+
+  return `
+    <div class="viewport">
+      <div class="panel">
+        ${renderStructuredNextStep(state)}
+        <div class="thread-scroll">
+          ${renderMessages(state)}
         </div>
-        <label class="composer-field">
-          <textarea id="promptInput" rows="3" placeholder="Tell Miru what to crawl, extract, or test next...">${escapeHtml(
-            state.prompt || DEFAULT_PROMPT
-          )}</textarea>
-        </label>
-        <div class="composer-bottom surface-card">
-          <div class="live-session-meta">
-            <p class="composer-hint">${escapeHtml(
-              pendingAction?.rationale ||
-                "Conversation becomes workflow, workflow becomes reusable JavaScript."
-            )}</p>
-            <div class="sidebar-meta">
-              <span>${pendingAction ? `${Math.round(pendingAction.confidence * 100)}% confidence` : "Waiting for first plan"}</span>
-              <span>${pendingAction?.requiresConfirmation ? "Needs approval" : "Can continue"}</span>
-              <span>${workflowCount} step${workflowCount === 1 ? "" : "s"}</span>
-              <span>${escapeHtml(routineSummary)}</span>
+        <div class="composer-stack">
+          ${renderExportToolbar(state)}
+          <div class="mode-float">
+            <div class="mode-pill-track" role="group" aria-label="Mode">
+              ${renderModePill(mode)}
             </div>
           </div>
-          <div class="composer-actions">
-            <button id="planBtn" class="secondary-button" type="button">Refine</button>
-            <button id="approveBtn" class="secondary-button" type="button" ${pendingAction ? "" : "disabled"}>Approve</button>
-            <button id="exportBtn" class="secondary-button" type="button" ${(state.workflowSteps ?? []).length > 0 ? "" : "disabled"}>Export JS</button>
-            <button id="resetBtn" class="ghost-button" type="button">Reset</button>
-            <button id="startBtn" class="primary-button" type="button">Send</button>
+          <div class="input-card">
+            <label class="sr-only" for="promptInput">Message</label>
+            <div class="input-body">
+              <textarea id="promptInput" rows="1" placeholder="Message Miru" spellcheck="false">${escapeHtml(textareaValue(state))}</textarea>
+              <button id="sendBtn" class="send-btn" type="button" ${busy ? "disabled" : ""} aria-label="Send">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+              </button>
+            </div>
           </div>
         </div>
-        <details class="workflow-drawer">
-          <summary>Recent workflow steps</summary>
-          <div class="workflow-list">
-            ${renderWorkflowSteps(state.workflowSteps)}
-          </div>
-        </details>
-        <div class="composer-top mobile-header-meta">
-          <div class="mode-row">
-            <span class="sidebar-label inline-label">Status</span>
-            <span class="status-pill status-${state.status}">${state.status}</span>
-          </div>
-          <div class="composer-actions compact-actions">
-            <button id="recordBtnMobile" class="ghost-button compact" type="button">${state.isRecording ? "Stop rec" : "Record"}</button>
-          </div>
-        </div>
-      </footer>
+      </div>
     </div>
   `;
 }
@@ -278,21 +210,6 @@ function renderApp(state: SessionState, hasStreamedResponse: boolean): string {
 async function sendRuntimeMessage(type: string, payload?: unknown): Promise<SessionState> {
   const response = (await chrome.runtime.sendMessage({ type, payload })) as SessionResponseMessage;
   return response.payload;
-}
-
-async function exportRecordedScript(): Promise<{ filename: string; script: string }> {
-  const response = (await chrome.runtime.sendMessage({ type: "EXPORT_SESSION_SCRIPT" })) as ExportScriptResponseMessage;
-  return response.payload;
-}
-
-function downloadTextFile(filename: string, script: string): void {
-  const blob = new Blob([script], { type: "text/javascript;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
 }
 
 function applyStreamEvent(state: SessionState, event: PlannerStreamEvent): SessionState {
@@ -344,43 +261,52 @@ function applyStreamEvent(state: SessionState, event: PlannerStreamEvent): Sessi
     return { ...state, chatMessages: currentMessages.slice(-30) };
   }
 
-  const idx = getIndex(event.messageId);
-  if (idx >= 0) {
-    currentMessages[idx] = {
-      ...currentMessages[idx],
-      status: "error",
-      content: `${currentMessages[idx].content}\n${event.error}`,
-    };
-  } else {
-    currentMessages.push({
-      id: event.messageId,
-      role: "assistant",
-      content: event.error,
-      status: "error",
-      createdAt: event.createdAt,
-    });
+  if (event.type === "assistant_message_error") {
+    const idx = getIndex(event.messageId);
+    const errText = event.error;
+    if (idx >= 0) {
+      const prior = currentMessages[idx].content.trim();
+      currentMessages[idx] = {
+        ...currentMessages[idx],
+        status: "error",
+        content: prior ? `${currentMessages[idx].content}\n${errText}` : errText,
+      };
+    } else {
+      currentMessages.push({
+        id: event.messageId,
+        role: "assistant",
+        content: errText,
+        status: "error",
+        createdAt: event.createdAt,
+      });
+    }
+    return { ...state, chatMessages: currentMessages.slice(-30), status: "error" };
   }
 
-  return { ...state, chatMessages: currentMessages.slice(-30) };
+  return state;
+}
+
+function normalizeMode(mode: MiruMode): MiruMode {
+  return mode === "interactive" ? "ask" : mode;
 }
 
 export function initMiruApp(root: HTMLElement): void {
-  let selectedMode: MiruMode = "interactive";
-  let hasStreamedResponse = false;
+  let selectedMode: MiruMode = "ask";
   let state: SessionState = {
     id: null,
-    mode: "interactive",
+    mode: "ask",
     prompt: DEFAULT_PROMPT,
     status: "idle",
     history: [],
     workflowSteps: [],
+    scrapeArtifacts: [],
     chatMessages: [],
     isRecording: false,
     updatedAt: Date.now(),
   };
 
   const render = (): void => {
-    root.innerHTML = renderApp({ ...state, mode: selectedMode || state.mode }, hasStreamedResponse);
+    root.innerHTML = renderApp({ ...state, mode: selectedMode }, selectedMode);
     const thread = root.querySelector<HTMLElement>(".thread-scroll");
     if (thread) {
       thread.scrollTop = thread.scrollHeight;
@@ -388,61 +314,77 @@ export function initMiruApp(root: HTMLElement): void {
 
     root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((button) => {
       button.addEventListener("click", () => {
-        selectedMode = button.dataset.mode as MiruMode;
+        selectedMode = normalizeMode(button.dataset.mode as MiruMode);
         render();
       });
     });
 
-    root.querySelector<HTMLButtonElement>("#startBtn")?.addEventListener("click", async () => {
-      const promptInput = root.querySelector<HTMLTextAreaElement>("#promptInput");
-      state = await sendRuntimeMessage("START_SESSION", {
-        prompt: promptInput?.value || DEFAULT_PROMPT,
-        mode: selectedMode,
+    const scrapeArtifacts = state.scrapeArtifacts ?? [];
+    if (scrapeArtifacts.length > 0) {
+      const baseFilename = exportBaseFilename(state.prompt);
+      root.querySelector<HTMLButtonElement>("#downloadCsvBtn")?.addEventListener("click", () => {
+        downloadArtifactsCsv(scrapeArtifacts, baseFilename);
       });
-      selectedMode = state.mode;
+      root.querySelector<HTMLButtonElement>("#downloadPdfBtn")?.addEventListener("click", () => {
+        downloadArtifactsPdf(scrapeArtifacts, baseFilename);
+      });
+    }
+
+    const send = async (): Promise<void> => {
+      const promptInput = root.querySelector<HTMLTextAreaElement>("#promptInput");
+      const text = (promptInput?.value ?? "").trim();
+      if (promptInput) {
+        promptInput.value = "";
+      }
+
+      try {
+        if (state.status === "awaiting_approval" && state.pendingAction) {
+          state = await sendRuntimeMessage("APPROVE_PENDING_ACTION");
+        } else if (!state.id || state.status === "idle") {
+          state = await sendRuntimeMessage("START_SESSION", {
+            prompt: text || DEFAULT_PROMPT,
+            mode: selectedMode,
+          });
+        } else {
+          state = await sendRuntimeMessage("PLAN_NEXT_ACTION", {
+            userMessage: text || undefined,
+            mode: selectedMode,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Request failed.";
+        const id = crypto.randomUUID();
+        const fallbackMessage: ChatMessage = {
+          id,
+          role: "assistant",
+          content: msg,
+          status: "error",
+          createdAt: Date.now(),
+        };
+        state = {
+          ...state,
+          status: "error",
+          lastError: msg,
+          chatMessages: [...(state.chatMessages ?? []), fallbackMessage].slice(-30),
+        };
+      }
+
+      selectedMode = normalizeMode(state.mode);
       render();
+    };
+
+    root.querySelector<HTMLButtonElement>("#sendBtn")?.addEventListener("click", () => {
+      void send();
     });
 
-    root.querySelector<HTMLButtonElement>("#planBtn")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("PLAN_NEXT_ACTION");
-      selectedMode = state.mode;
-      render();
-    });
-
-    root.querySelector<HTMLButtonElement>("#approveBtn")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("APPROVE_PENDING_ACTION");
-      selectedMode = state.mode;
-      render();
-    });
-
-    root.querySelector<HTMLButtonElement>("#refreshBtn")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("REFRESH_CONTEXT");
-      selectedMode = state.mode;
-      render();
-    });
-
-    root.querySelector<HTMLButtonElement>("#recordBtnInline")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("TOGGLE_RECORDING");
-      selectedMode = state.mode;
-      render();
-    });
-    root.querySelector<HTMLButtonElement>("#recordBtnMobile")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("TOGGLE_RECORDING");
-      selectedMode = state.mode;
-      render();
-    });
-
-    root.querySelector<HTMLButtonElement>("#exportBtn")?.addEventListener("click", async () => {
-      const exported = await exportRecordedScript();
-      downloadTextFile(exported.filename, exported.script);
-      state = await sendRuntimeMessage("GET_SESSION");
-      render();
-    });
-
-    root.querySelector<HTMLButtonElement>("#resetBtn")?.addEventListener("click", async () => {
-      state = await sendRuntimeMessage("STOP_SESSION");
-      selectedMode = state.mode;
-      render();
+    root.querySelector<HTMLTextAreaElement>("#promptInput")?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        if (["capturing", "planning", "executing"].includes(state.status)) {
+          return;
+        }
+        void send();
+      }
     });
   };
 
@@ -454,17 +396,11 @@ export function initMiruApp(root: HTMLElement): void {
       }
 
       state = applyStreamEvent(state, message.payload);
-      if (message.payload.type === "assistant_token") {
-        hasStreamedResponse = true;
-      }
       render();
     });
 
     state = await sendRuntimeMessage("GET_SESSION");
-    selectedMode = state.mode;
-    hasStreamedResponse = (state.chatMessages ?? []).some(
-      (message) => message.role === "assistant" && message.content.trim().length > 0
-    );
+    selectedMode = normalizeMode(state.mode);
     render();
   };
 

@@ -58,6 +58,15 @@ Copy `.env.example` to `.env` and fill in:
 If the Supabase values are missing, the backend still runs with in-memory storage for local demos.
 If `GROQ_API_KEY` is missing, the backend cannot call the model-backed planner.
 
+## Logging
+
+Logs go to **stdout** as **JSON** (Pino). Each line includes a `msg` field (for example `→ POST /v1/plan/stream` on every request, then `POST /v1/plan/stream: start` / `plan resolved` / `complete` for the planner).
+
+- Set **`LOG_LEVEL`** to `debug`, `info`, `warn`, or `error` (default `info`). If you set `LOG_LEVEL=silent` you will see almost nothing.
+- If the extension uses the wrong `MIRU_BACKEND_URL`, you will see **no** planner traffic—only startup and maybe `/health`.
+
+For human-readable logs in development, pipe through [pino-pretty](https://github.com/pinojs/pino-pretty): `npm run dev 2>&1 | npx pino-pretty` (install `pino-pretty` as a dev dependency if you want this often).
+
 ## Local Run
 
 ```bash

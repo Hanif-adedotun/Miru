@@ -25,10 +25,12 @@ import type {
   ProposedAction,
   PlannerRequest,
   RecordedSession,
+  ScrapeArtifact,
   SessionEvent,
   SessionResponseMessage,
   SessionState,
   SessionStreamEventMessage,
+  PlanNextActionPayload,
   StartSessionPayload,
   WorkflowStep,
   WorkflowStepStatus,
@@ -36,6 +38,12 @@ import type {
 
 const SESSION_STREAM_PORT = "miru-session-stream";
 const streamPorts = new Set<chrome.runtime.Port>();
+
+const MAX_SCRAPE_ARTIFACTS = 40;
+const MAX_ROWS_PER_SCRAPE_ARTIFACT = 1500;
+
+/** Max plan→execute cycles per user send in auto mode (avoids infinite loops). */
+const AUTO_CHAIN_MAX_STEPS = 25;
 
 function createEmptySession(): SessionState {
   return {
@@ -56,6 +64,7 @@ function createEmptySession(): SessionState {
       },
     ],
     isRecording: false,
+    scrapeArtifacts: [],
     updatedAt: Date.now(),
   };
 }
@@ -120,7 +129,8 @@ function updateStepStatus(
   workflowSteps: WorkflowStep[] | undefined,
   stepId: string,
   status: WorkflowStepStatus,
-  resultSummary?: string
+  resultSummary?: string,
+  resultData?: unknown
 ): WorkflowStep[] {
   return (workflowSteps ?? []).map((step) =>
     step.id === stepId
@@ -128,10 +138,141 @@ function updateStepStatus(
           ...step,
           status,
           resultSummary: resultSummary ?? step.resultSummary,
+          ...(resultData !== undefined ? { resultData } : {}),
           updatedAt: Date.now(),
         }
       : step
   );
+}
+
+function normalizeRowStrings(row: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[key] = value === null || value === undefined ? "" : String(value);
+  }
+  return out;
+}
+
+function buildScrapeArtifact(stepId: string, action: MiruAction, result: unknown): ScrapeArtifact | null {
+  if (action.type === "QUERY") {
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      return null;
+    }
+
+    const row = normalizeRowStrings(result as Record<string, unknown>);
+    const columns = ["selector", "label", "tagName", "role"].filter((key) =>
+      Object.prototype.hasOwnProperty.call(row, key)
+    );
+    if (columns.length === 0) {
+      return null;
+    }
+
+    const orderedRow: Record<string, string> = {};
+    for (const column of columns) {
+      orderedRow[column] = row[column] ?? "";
+    }
+
+    return {
+      id: crypto.randomUUID(),
+      stepId,
+      createdAt: Date.now(),
+      source: "QUERY",
+      label: `QUERY: ${action.selector}`,
+      columns,
+      rows: [orderedRow],
+    };
+  }
+
+  if (action.type === "EXTRACT") {
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      return null;
+    }
+
+    const row = normalizeRowStrings(result as Record<string, unknown>);
+    const fromFields = action.fields
+      .map((field) => field.name)
+      .filter((name) => Object.prototype.hasOwnProperty.call(row, name));
+    const columns = fromFields.length > 0 ? fromFields : Object.keys(row);
+    if (columns.length === 0) {
+      return null;
+    }
+
+    const orderedRow: Record<string, string> = {};
+    for (const column of columns) {
+      orderedRow[column] = row[column] ?? "";
+    }
+
+    return {
+      id: crypto.randomUUID(),
+      stepId,
+      createdAt: Date.now(),
+      source: "EXTRACT",
+      label: `EXTRACT: ${action.fields.map((field) => field.name).join(", ")}`,
+      columns,
+      rows: [orderedRow],
+    };
+  }
+
+  if (action.type === "EXTRACT_LIST") {
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      return null;
+    }
+
+    const rowsRaw = (result as { rows?: unknown }).rows;
+    if (!Array.isArray(rowsRaw) || rowsRaw.length === 0) {
+      return null;
+    }
+
+    const rows = rowsRaw
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+      .map(normalizeRowStrings);
+    const columnOrder = action.fields.map((field) => field.name);
+    if (columnOrder.length === 0 || rows.length === 0) {
+      return null;
+    }
+
+    const normalizedRows = rows.map((row) => {
+      const ordered: Record<string, string> = {};
+      for (const column of columnOrder) {
+        ordered[column] = row[column] ?? "";
+      }
+      return ordered;
+    });
+
+    return {
+      id: crypto.randomUUID(),
+      stepId,
+      createdAt: Date.now(),
+      source: "EXTRACT_LIST",
+      label: `EXTRACT_LIST: ${action.itemSelector} (${normalizedRows.length} rows)`,
+      columns: columnOrder,
+      rows: normalizedRows,
+    };
+  }
+
+  return null;
+}
+
+function trimScrapeArtifacts(artifacts: ScrapeArtifact[] | undefined): ScrapeArtifact[] | undefined {
+  if (!artifacts || artifacts.length === 0) {
+    return artifacts;
+  }
+
+  return artifacts.slice(-MAX_SCRAPE_ARTIFACTS).map((artifact) => ({
+    ...artifact,
+    columns: artifact.columns.slice(0, 64),
+    rows: artifact.rows.slice(0, MAX_ROWS_PER_SCRAPE_ARTIFACT),
+  }));
+}
+
+function workflowStepTitle(action: MiruAction): string {
+  if (action.type === "EXTRACT") {
+    return "Extract data";
+  }
+  if (action.type === "EXTRACT_LIST") {
+    return "Extract list";
+  }
+  return action.type;
 }
 
 function appendChatMessages(session: SessionState, ...messages: ChatMessage[]): SessionState {
@@ -196,10 +337,13 @@ function setMessageStatus(
   }
 
   const next = [...current];
+  const prior = next[index].content.trim();
+  const nextContent =
+    fallback && prior ? `${next[index].content}\n${fallback}` : fallback && !prior ? fallback : next[index].content;
   next[index] = {
     ...next[index],
     status,
-    content: fallback ? `${next[index].content}\n${fallback}` : next[index].content,
+    content: nextContent,
   };
   return {
     ...session,
@@ -221,6 +365,8 @@ function actionToScript(action: MiruAction): string {
       return `await wait(${action.durationMs});`;
     case "EXTRACT":
       return `await extract(${JSON.stringify(action.fields, null, 2)});`;
+    case "EXTRACT_LIST":
+      return `await extractList(${JSON.stringify(action.itemSelector)}, ${JSON.stringify(action.fields, null, 2)}, ${JSON.stringify(action.maxItems ?? null)});`;
     case "STOP":
       return `return { stopped: true, reason: ${JSON.stringify(action.reason)} };`;
     default:
@@ -245,7 +391,7 @@ function buildExportedScript(session: SessionState): { filename: string; script:
  * Generated: ${new Date().toISOString()}
  */
 
-async function runMiruWorkflow({ query, click, type, scroll, wait, extract }) {
+async function runMiruWorkflow({ query, click, type, scroll, wait, extract, extractList }) {
 ${commandBody || "  // No workflow steps were recorded yet."}
 }
 
@@ -280,6 +426,7 @@ async function saveSession(session: SessionState): Promise<SessionState> {
     ...session,
     history: session.history.slice(-MAX_HISTORY_ITEMS),
     workflowSteps: (session.workflowSteps ?? []).slice(-50),
+    scrapeArtifacts: trimScrapeArtifacts(session.scrapeArtifacts),
     chatMessages: (session.chatMessages ?? []).slice(-30),
     updatedAt: Date.now(),
   };
@@ -366,6 +513,75 @@ function shouldAutoExecute(mode: MiruMode, action: ProposedAction): boolean {
   return !action.requiresConfirmation || action.risk !== "high";
 }
 
+function lastWorkflowStep(session: SessionState): WorkflowStep | undefined {
+  const steps = session.workflowSteps ?? [];
+  return steps[steps.length - 1];
+}
+
+/**
+ * After a successful action in auto mode, keep planning and executing until STOP,
+ * approval is required, an error, or the step cap — so multi-step goals are not stuck after one QUERY/CLICK.
+ */
+async function runAutoModeContinuation(session: SessionState): Promise<SessionState> {
+  if (session.mode !== "auto" || session.status !== "ready") {
+    return session;
+  }
+
+  const initialLast = lastWorkflowStep(session);
+  if (initialLast?.status === "succeeded" && initialLast.action.type === "STOP") {
+    return session;
+  }
+
+  let current = session;
+
+  for (let i = 0; i < AUTO_CHAIN_MAX_STEPS; i++) {
+    current = await saveSession({ ...current, status: "planning" });
+    current = await planForSession(current);
+
+    if (current.status === "error" || !current.pendingAction) {
+      return current;
+    }
+
+    if (!shouldAutoExecute(current.mode, current.pendingAction)) {
+      return current;
+    }
+
+    current = await executePendingAction(current);
+
+    if (current.status === "error") {
+      return current;
+    }
+
+    const done = lastWorkflowStep(current);
+    if (done?.status === "succeeded" && done.action.type === "STOP") {
+      return current;
+    }
+
+    if (current.mode !== "auto" || current.status !== "ready") {
+      return current;
+    }
+  }
+
+  return appendChatMessages(
+    await saveSession({
+      ...current,
+      history: [
+        ...current.history,
+        makeEvent(
+          "Auto chain limit",
+          `Stopped after ${AUTO_CHAIN_MAX_STEPS} chained actions. Send another message to continue.`,
+          "warning"
+        ),
+      ],
+    }),
+    createChatMessage(
+      "system",
+      `Auto mode paused after ${AUTO_CHAIN_MAX_STEPS} steps in one run. Send a message to continue.`,
+      "complete"
+    )
+  );
+}
+
 async function executeAction(tabId: number, action: MiruAction): Promise<ActionResultPayload> {
   const response = (await chrome.tabs.sendMessage(tabId, {
     type: "EXECUTE_ACTION",
@@ -444,73 +660,96 @@ async function planForSession(session: SessionState): Promise<SessionState> {
   });
 
   let lastTokenFlushAt = Date.now();
-  const { sessionId, proposedAction } = await fetchNextActionStream(plannerRequest, async (event) => {
-    if (event.type === "assistant_message_start") {
-      return;
-    }
 
-    if (event.type === "assistant_token") {
-      streamingSession = appendTokenToMessage(streamingSession, streamMessageId, event.token, "thinking");
-      const now = Date.now();
-      if (now - lastTokenFlushAt > 45) {
-        streamingSession = await saveSession(streamingSession);
-        lastTokenFlushAt = now;
+  try {
+    const { sessionId, proposedAction } = await fetchNextActionStream(plannerRequest, async (event) => {
+      if (event.type === "assistant_message_start") {
+        return;
       }
-      broadcastStreamEvent({
-        ...event,
-        messageId: streamMessageId,
-      });
-      return;
-    }
 
-    if (event.type === "assistant_message_done") {
-      streamingSession = setMessageStatus(streamingSession, streamMessageId, "complete");
+      if (event.type === "assistant_token") {
+        streamingSession = appendTokenToMessage(streamingSession, streamMessageId, event.token, "thinking");
+        const now = Date.now();
+        if (now - lastTokenFlushAt > 45) {
+          streamingSession = await saveSession(streamingSession);
+          lastTokenFlushAt = now;
+        }
+        broadcastStreamEvent({
+          ...event,
+          messageId: streamMessageId,
+        });
+        return;
+      }
+
+      if (event.type === "assistant_message_done") {
+        streamingSession = setMessageStatus(streamingSession, streamMessageId, "complete");
+        streamingSession = await saveSession(streamingSession);
+        broadcastStreamEvent({
+          ...event,
+          messageId: streamMessageId,
+        });
+        return;
+      }
+
+      streamingSession = setMessageStatus(streamingSession, streamMessageId, "error", event.error);
       streamingSession = await saveSession(streamingSession);
       broadcastStreamEvent({
         ...event,
         messageId: streamMessageId,
       });
-      return;
-    }
-
-    streamingSession = setMessageStatus(streamingSession, streamMessageId, "error", event.error);
-    streamingSession = await saveSession(streamingSession);
-    broadcastStreamEvent({
-      ...event,
-      messageId: streamMessageId,
     });
-  });
-  streamingSession = setMessageStatus(streamingSession, streamMessageId, "complete");
-  streamingSession = await saveSession(streamingSession);
 
-  const workflowStep: WorkflowStep = {
-    id: proposedAction.id,
-    action: proposedAction.action,
-    title: proposedAction.action.type === "EXTRACT" ? "Extract data" : proposedAction.action.type,
-    rationale: proposedAction.rationale,
-    status: shouldAutoExecute(session.mode, proposedAction) ? "running" : "planned",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  };
-  const plannedSession = appendChatMessages(
-    {
-      ...streamingSession,
-      id: sessionId,
-      pendingAction: proposedAction,
-      workflowSteps: [...(streamingSession.workflowSteps ?? []), workflowStep],
-      status: shouldAutoExecute(streamingSession.mode, proposedAction) ? "executing" : "awaiting_approval",
-      history: [
-        ...streamingSession.history,
-        makeEvent(
-          "Next action ready",
-          proposedAction.rationale,
-          proposedAction.requiresConfirmation ? "warning" : "info"
-        ),
-      ],
+    streamingSession = setMessageStatus(streamingSession, streamMessageId, "complete");
+    streamingSession = await saveSession(streamingSession);
+
+    const workflowStep: WorkflowStep = {
+      id: proposedAction.id,
+      action: proposedAction.action,
+      title: workflowStepTitle(proposedAction.action),
+      rationale: proposedAction.rationale,
+      status: shouldAutoExecute(session.mode, proposedAction) ? "running" : "planned",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const plannedSession = appendChatMessages(
+      {
+        ...streamingSession,
+        id: sessionId,
+        pendingAction: proposedAction,
+        workflowSteps: [...(streamingSession.workflowSteps ?? []), workflowStep],
+        status: shouldAutoExecute(streamingSession.mode, proposedAction) ? "executing" : "awaiting_approval",
+        history: [
+          ...streamingSession.history,
+          makeEvent(
+            "Next action ready",
+            proposedAction.rationale,
+            proposedAction.requiresConfirmation ? "warning" : "info"
+          ),
+        ],
+      }
+    );
+
+    return saveSession(plannedSession);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Planning failed.";
+    const cur = (streamingSession.chatMessages ?? []).find((item) => item.id === streamMessageId);
+    if (cur?.status === "thinking") {
+      streamingSession = setMessageStatus(streamingSession, streamMessageId, "error", message);
+      broadcastStreamEvent({
+        type: "assistant_message_error",
+        messageId: streamMessageId,
+        error: message,
+        createdAt: Date.now(),
+      });
     }
-  );
 
-  return saveSession(plannedSession);
+    return saveSession({
+      ...streamingSession,
+      status: "error",
+      lastError: message,
+      history: [...streamingSession.history, makeEvent("Planning failed", message, "error")],
+    });
+  }
 }
 
 async function executePendingAction(session: SessionState): Promise<SessionState> {
@@ -534,17 +773,25 @@ async function executePendingAction(session: SessionState): Promise<SessionState
   );
   const result = await executeAction(session.tabId, action.action);
   const eventStatus = result.success ? "success" : "error";
+  const artifact =
+    result.success ? buildScrapeArtifact(action.id, action.action, result.result) : null;
+  const scrapeArtifacts = artifact
+    ? [...(workingSession.scrapeArtifacts ?? []), artifact]
+    : (workingSession.scrapeArtifacts ?? []);
+
   let nextSession = await saveSession({
     ...workingSession,
     lastResult: result,
     lastError: result.success ? undefined : result.error,
     pendingAction: undefined,
     status: result.success ? "ready" : "error",
+    scrapeArtifacts,
     workflowSteps: updateStepStatus(
       workingSession.workflowSteps,
       action.id,
       result.success ? "succeeded" : "failed",
-      JSON.stringify(result.result ?? result.error ?? action.action)
+      JSON.stringify(result.result ?? result.error ?? action.action),
+      result.success ? result.result : undefined
     ),
     history: [
       ...workingSession.history,
@@ -597,6 +844,7 @@ async function startSession(payload: StartSessionPayload): Promise<SessionState>
         origin: tab.url ? new URL(tab.url).origin : undefined,
         history: [makeEvent("Session started", `Mode: ${payload.mode}`, "info")],
         workflowSteps: [],
+        scrapeArtifacts: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
       })),
@@ -615,8 +863,9 @@ async function startSession(payload: StartSessionPayload): Promise<SessionState>
   session = await saveSession({ ...session, status: "planning" });
   session = await planForSession(session);
 
-  if (session.pendingAction && shouldAutoExecute(session.mode, session.pendingAction)) {
+  if (session.status !== "error" && session.pendingAction && shouldAutoExecute(session.mode, session.pendingAction)) {
     session = await executePendingAction(session);
+    session = await runAutoModeContinuation(session);
   }
 
   return session;
@@ -675,10 +924,30 @@ chrome.runtime.onMessage.addListener(
 
     if (message.type === "PLAN_NEXT_ACTION") {
       void respondWithSession(async () => {
-        const session = await saveSession({ ...(await getStoredSession()), status: "planning" });
+        const payload = (message.payload ?? {}) as PlanNextActionPayload;
+        let session = await getStoredSession();
+        if (payload.mode === "auto" || payload.mode === "ask") {
+          session = { ...session, mode: payload.mode };
+        }
+        if (payload.userMessage?.trim()) {
+          const text = payload.userMessage.trim();
+          session = await saveSession(
+            appendChatMessages(
+              { ...session, prompt: text },
+              createChatMessage("user", text, "complete")
+            )
+          );
+        }
+        session = await saveSession({ ...session, status: "planning" });
         const planned = await planForSession(session);
-        if (planned.pendingAction && shouldAutoExecute(planned.mode, planned.pendingAction)) {
-          await executePendingAction(planned);
+        if (
+          planned.status !== "error" &&
+          planned.pendingAction &&
+          shouldAutoExecute(planned.mode, planned.pendingAction)
+        ) {
+          let after = await executePendingAction(planned);
+          after = await runAutoModeContinuation(after);
+          await saveSession(after);
         }
       });
       return true;
@@ -749,7 +1018,9 @@ chrome.runtime.onMessage.addListener(
     if (message.type === "APPROVE_PENDING_ACTION") {
       void respondWithSession(async () => {
         const session = await saveSession({ ...(await getStoredSession()), status: "executing" });
-        await executePendingAction(session);
+        let after = await executePendingAction(session);
+        after = await runAutoModeContinuation(after);
+        await saveSession(after);
       });
       return true;
     }

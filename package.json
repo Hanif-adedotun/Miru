@@ -4,11 +4,16 @@
   "description": "AI-driven browser agent for Chrome",
   "type": "module",
   "scripts": {
-    "build": "node scripts/generate-extension-config.mjs && tsc -p tsconfig.build.json && npm run bundle:content && npm run copy-assets",
+    "build": "node scripts/generate-extension-config.mjs && tsc -p tsconfig.build.json && npm run bundle:content && npm run bundle:sidepanel && npm run copy-assets",
     "bundle:content": "esbuild src/content/contentScript.ts --bundle --format=iife --platform=browser --outfile=dist/content/contentScript.js",
+    "bundle:sidepanel": "mkdir -p dist/ui && esbuild src/ui/sidepanel.ts --bundle --format=esm --platform=browser --outfile=dist/ui/sidepanel.js",
     "copy-assets": "mkdir -p dist && cp -r public dist/ && cp src/manifest.json dist/ && cp src/ui/*.html dist/ui/ && cp src/ui/*.css dist/ui/",
-    "watch": "node scripts/generate-extension-config.mjs && concurrently -k \"tsc -p tsconfig.build.json --watch --preserveWatchOutput\" \"npm run bundle:content -- --watch\"",
+    "watch": "node scripts/generate-extension-config.mjs && concurrently -k \"tsc -p tsconfig.build.json --watch --preserveWatchOutput\" \"npm run bundle:content -- --watch\" \"npm run bundle:sidepanel -- --watch\"",
     "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "jspdf": "^2.5.2",
+    "jspdf-autotable": "^3.8.4"
   },
   "keywords": [
     "chrome-extension",

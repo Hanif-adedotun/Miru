@@ -25,10 +25,21 @@ export interface ExtractionField {
   attr?: string;
 }
 
+export interface ExtractListField {
+  name: string;
+  attr: string;
+}
+
 export type MiruAction =
   | { type: "QUERY"; selector: string }
   | { type: "CLICK"; selector: string }
   | { type: "EXTRACT"; fields: ExtractionField[] }
+  | {
+      type: "EXTRACT_LIST";
+      itemSelector: string;
+      fields: ExtractListField[];
+      maxItems?: number | null;
+    }
   | { type: "TYPE"; selector: string; text: string }
   | { type: "SCROLL"; direction: "up" | "down" | "to"; amount?: number }
   | { type: "WAIT"; durationMs: number }
@@ -59,6 +70,7 @@ export interface WorkflowStep {
   rationale?: string;
   status: WorkflowStepStatus;
   resultSummary?: string;
+  resultData?: unknown;
   createdAt: number;
   updatedAt: number;
 }

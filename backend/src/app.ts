@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 
-import { planNextAction, streamPlanNarration } from "./planner.js";
+import { planNextAction, streamAlignedNarration, streamPlanNarration } from "./planner.js";
 import { registerRoutes } from "./routes.js";
 import { createStorageAdapter, type StorageAdapter } from "./storage.js";
 import type { PlanRequest, ProposedAction } from "./types.js";
@@ -10,14 +10,29 @@ declare module "fastify" {
     planner: {
       plan(request: PlanRequest): Promise<ProposedAction>;
       streamNarration(request: PlanRequest, onToken: (token: string) => Promise<void> | void): Promise<void>;
+      streamAlignedNarration(
+        request: PlanRequest,
+        proposed: ProposedAction,
+        onToken: (token: string) => Promise<void> | void
+      ): Promise<void>;
     };
     storage: StorageAdapter;
   }
 }
 
 export async function buildApp() {
+  const logLevel = process.env.LOG_LEVEL ?? "info";
   const app = Fastify({
-    logger: true,
+    logger: {
+      level: logLevel,
+    },
+  });
+
+  app.addHook("onRequest", async (request) => {
+    request.log.info(
+      { method: request.method, url: request.url },
+      `→ ${request.method} ${request.url}`
+    );
   });
 
   app.addHook("onSend", async (_request, reply, payload) => {
@@ -34,6 +49,7 @@ export async function buildApp() {
   app.decorate("planner", {
     plan: planNextAction,
     streamNarration: streamPlanNarration,
+    streamAlignedNarration,
   });
 
   app.decorate("storage", createStorageAdapter());

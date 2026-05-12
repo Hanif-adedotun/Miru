@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { PlanRequest, PlanResponse, PlanStreamEvent } from "./types.js";
-import { createId } from "./utils.js";
+import { createId, truncate } from "./utils.js";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -42,7 +42,26 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
       const requestBody = request.body;
       const sessionId = requestBody.sessionId || createId();
+      request.log.info(
+        {
+          sessionId,
+          mode: requestBody.mode,
+          promptPreview: truncate(requestBody.prompt, 120),
+        },
+        "POST /v1/plan: planning"
+      );
+
       const proposedAction = await app.planner.plan(requestBody);
+
+      request.log.info(
+        {
+          sessionId,
+          actionType: proposedAction.action.type,
+          risk: proposedAction.risk,
+          requiresConfirmation: proposedAction.requiresConfirmation,
+        },
+        "POST /v1/plan: done"
+      );
 
       const persisted = {
         sessionId,
@@ -81,6 +100,15 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       const messageId = createId();
       let streamClosed = false;
 
+      request.log.info(
+        {
+          sessionId,
+          mode: requestBody.mode,
+          promptPreview: truncate(requestBody.prompt, 120),
+        },
+        "POST /v1/plan/stream: start"
+      );
+
       reply.raw.on("close", () => {
         streamClosed = true;
       });
@@ -102,7 +130,29 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       });
 
       try {
-        await app.planner.streamNarration(requestBody, (token) => {
+        const proposedAction = await app.planner.plan(requestBody);
+        const persisted = {
+          sessionId,
+          prompt: requestBody.prompt,
+          mode: requestBody.mode,
+          context: requestBody.context,
+          proposedAction,
+        };
+
+        await app.storage.upsertSession(persisted);
+        await app.storage.savePlan(persisted);
+        const previousPlans = await app.storage.getPlanCount(sessionId);
+
+        request.log.info(
+          {
+            sessionId,
+            actionType: proposedAction.action.type,
+            risk: proposedAction.risk,
+          },
+          "POST /v1/plan/stream: plan resolved, streaming narration"
+        );
+
+        await app.planner.streamAlignedNarration(requestBody, proposedAction, (token) => {
           if (streamClosed) {
             return;
           }
@@ -116,19 +166,6 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
             },
           });
         });
-
-        const proposedAction = await app.planner.plan(requestBody);
-        const persisted = {
-          sessionId,
-          prompt: requestBody.prompt,
-          mode: requestBody.mode,
-          context: requestBody.context,
-          proposedAction,
-        };
-
-        await app.storage.upsertSession(persisted);
-        await app.storage.savePlan(persisted);
-        const previousPlans = await app.storage.getPlanCount(sessionId);
 
         if (!streamClosed) {
           writeSseEvent(reply, {
@@ -150,8 +187,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
             },
           });
         }
+
+        request.log.info({ sessionId, streamClosed }, "POST /v1/plan/stream: complete");
       } catch (error) {
-        app.log.error(error);
+        request.log.error({ sessionId, err: error }, "POST /v1/plan/stream: failed");
         if (!streamClosed) {
           writeSseEvent(reply, {
             event: "assistant_message_error",

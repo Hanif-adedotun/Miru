@@ -41,10 +41,24 @@ export interface ExtractionField {
   attr?: string;
 }
 
+/** Column read from each element matched by `itemSelector` (attr empty = visible text). */
+export interface ExtractListField {
+  name: string;
+  /** HTML attribute name, or empty string for visible text on that element. */
+  attr: string;
+}
+
 export type MiruAction =
   | { type: "QUERY"; selector: string }
   | { type: "CLICK"; selector: string }
   | { type: "EXTRACT"; fields: ExtractionField[] }
+  | {
+      type: "EXTRACT_LIST";
+      itemSelector: string;
+      fields: ExtractListField[];
+      /** Cap rows returned; omit or null to use default (500) in the content script. */
+      maxItems?: number | null;
+    }
   | { type: "TYPE"; selector: string; text: string }
   | { type: "SCROLL"; direction: "up" | "down" | "to"; amount?: number }
   | { type: "WAIT"; durationMs: number }
@@ -92,8 +106,21 @@ export interface WorkflowStep {
   rationale?: string;
   status: WorkflowStepStatus;
   resultSummary?: string;
+  /** Structured result when available (e.g. extraction payloads). */
+  resultData?: unknown;
   createdAt: number;
   updatedAt: number;
+}
+
+/** Tabular scrape output from a successful QUERY, EXTRACT, or EXTRACT_LIST step. */
+export interface ScrapeArtifact {
+  id: string;
+  stepId: string;
+  createdAt: number;
+  source: "QUERY" | "EXTRACT" | "EXTRACT_LIST";
+  label: string;
+  columns: string[];
+  rows: Record<string, string>[];
 }
 
 export interface SavedRoutine {
@@ -137,6 +164,8 @@ export interface SessionState {
   lastResult?: ActionResultPayload;
   history: SessionEvent[];
   workflowSteps?: WorkflowStep[];
+  /** Aggregated table-like results from extract steps in this session. */
+  scrapeArtifacts?: ScrapeArtifact[];
   chatMessages?: ChatMessage[];
   isRecording?: boolean;
   recordedSession?: RecordedSession;
@@ -228,6 +257,12 @@ export interface Message {
 export interface StartSessionPayload {
   prompt: string;
   mode: MiruMode;
+}
+
+/** Optional user line and mode before re-planning (continues an existing session). */
+export interface PlanNextActionPayload {
+  userMessage?: string;
+  mode?: MiruMode;
 }
 
 export interface SessionResponseMessage extends Message {

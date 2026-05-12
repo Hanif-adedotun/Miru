@@ -9,7 +9,9 @@ import type {
   ErrorMessage,
   ExecuteActionMessage,
   ExtractionField,
+  ExtractListField,
   Message,
+  MiruAction,
   PageContext,
 } from "../shared/types.js";
 import {
@@ -149,6 +151,15 @@ function extractField(field: ExtractionField): string | null {
   return (element as HTMLElement).innerText?.trim() || element.textContent?.trim() || null;
 }
 
+function extractListFieldFromElement(element: Element, field: ExtractListField): string | null {
+  if (field.attr) {
+    return element.getAttribute(field.attr);
+  }
+
+  const htmlElement = element as HTMLElement;
+  return htmlElement.innerText?.trim() || element.textContent?.trim() || null;
+}
+
 async function executeAction(message: ExecuteActionMessage): Promise<ActionResultMessage | ErrorMessage> {
   const action = message.payload;
 
@@ -254,6 +265,37 @@ async function executeAction(message: ExecuteActionMessage): Promise<ActionResul
         };
       }
 
+      case "EXTRACT_LIST": {
+        let nodes: Element[];
+        try {
+          nodes = Array.from(document.querySelectorAll(action.itemSelector));
+        } catch {
+          return { type: "ERROR", error: "Invalid itemSelector for EXTRACT_LIST" };
+        }
+
+        const requestedCap =
+          action.maxItems === null || action.maxItems === undefined ? 500 : action.maxItems;
+        const cap = Math.min(Math.max(1, requestedCap), 2000);
+        const slice = nodes.slice(0, cap);
+        const rows = slice.map((element) => {
+          const row: Record<string, string | null> = {};
+          for (const field of action.fields) {
+            row[field.name] = extractListFieldFromElement(element, field);
+          }
+          return row;
+        });
+
+        highlightElement(slice[0] ?? null);
+
+        return {
+          type: "ACTION_RESULT",
+          payload: {
+            success: true,
+            result: { rows },
+          },
+        };
+      }
+
       case "STOP": {
         return {
           type: "ACTION_RESULT",
@@ -267,7 +309,7 @@ async function executeAction(message: ExecuteActionMessage): Promise<ActionResul
       default:
         return {
           type: "ERROR",
-          error: `Unknown action type: ${(action as Message).type}`,
+          error: `Unknown action type: ${(action as MiruAction).type}`,
         };
     }
   } catch (error) {

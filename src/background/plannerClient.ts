@@ -44,8 +44,14 @@ export async function fetchNextAction(request: PlannerRequest): Promise<{
   });
 
   if (!response.ok) {
-    const errorBody = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(errorBody?.error || `Planner request failed with status ${response.status}.`);
+    const errorBody = (await response.json().catch(() => null)) as { error?: string; message?: string } | null;
+    const fromJson = errorBody?.error || errorBody?.message;
+    const fromText = fromJson ? null : await response.text().catch(() => "");
+    throw new Error(
+      fromJson?.trim() ||
+        (fromText && fromText.trim().slice(0, 400)) ||
+        `Planner request failed with status ${response.status}.`
+    );
   }
 
   const payload = (await response.json()) as PlannerResponse;
@@ -130,8 +136,14 @@ export async function fetchNextActionStream(
   });
 
   if (!response.ok) {
-    const errorBody = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(errorBody?.error || `Planner stream failed with status ${response.status}.`);
+    const errorBody = (await response.json().catch(() => null)) as { error?: string; message?: string } | null;
+    const fromJson = errorBody?.error || errorBody?.message;
+    const fromText = fromJson ? null : await response.text().catch(() => "");
+    throw new Error(
+      fromJson?.trim() ||
+        (fromText && fromText.trim().slice(0, 400)) ||
+        `Planner stream failed with status ${response.status}.`
+    );
   }
 
   if (!response.body) {
@@ -144,6 +156,8 @@ export async function fetchNextActionStream(
   let currentEvent = "";
   let currentData = "";
   let result: { sessionId: string; proposedAction: ProposedAction } | null = null;
+  /** Set when the server emits `assistant_message_error` (no `plan_result` follows). */
+  let streamTerminalError: string | null = null;
 
   const flushFrame = async (): Promise<void> => {
     if (!currentEvent || !currentData) {
@@ -161,6 +175,9 @@ export async function fetchNextActionStream(
     } else {
       const mapped = toPlannerStreamEvent(frame);
       if (mapped) {
+        if (mapped.type === "assistant_message_error") {
+          streamTerminalError = mapped.error;
+        }
         await onEvent(mapped);
       }
     }
@@ -196,7 +213,7 @@ export async function fetchNextActionStream(
   }
 
   if (!result) {
-    throw new Error("Planner stream ended without a final plan result.");
+    throw new Error(streamTerminalError || "Planner stream ended without a final plan result.");
   }
 
   return result;

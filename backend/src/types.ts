@@ -43,6 +43,7 @@ export type MiruAction =
   | { type: "TYPE"; selector: string; text: string }
   | { type: "SCROLL"; direction: "up" | "down" | "to"; amount?: number }
   | { type: "WAIT"; durationMs: number }
+  | { type: "ASK_USER"; question: string; options?: string[] }
   | { type: "STOP"; reason: string };
 
 export interface PageContext {

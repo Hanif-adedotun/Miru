@@ -29,6 +29,7 @@ type PlannerAction =
   | { type: "WAIT"; durationMs: number }
   | { type: "EXTRACT"; fields: PlannerExtractField[] }
   | { type: "EXTRACT_LIST"; itemSelector: string; fields: PlannerExtractListField[]; maxItems: number | null }
+  | { type: "ASK_USER"; question: string; options: string[] }
   | { type: "STOP"; reason: string };
 
 interface PlannerModelResponse {
@@ -152,6 +153,19 @@ const plannerActionOneOf = [
     type: "object",
     additionalProperties: false,
     properties: {
+      type: { type: "string", enum: ["ASK_USER"] },
+      question: { type: "string" },
+      options: {
+        type: "array",
+        items: { type: "string" },
+      },
+    },
+    required: ["type", "question", "options"],
+  },
+  {
+    type: "object",
+    additionalProperties: false,
+    properties: {
       type: { type: "string", enum: ["STOP"] },
       reason: { type: "string" },
     },
@@ -199,12 +213,13 @@ function buildPlannerMessages(request: PlanRequest) {
         "Return only one constrained next action for the active tab.",
         "Never return JavaScript, code, prose outside the schema, or multi-step plans.",
         "Prefer read-only actions first when context is incomplete.",
-        "Use only these action types: QUERY, CLICK, EXTRACT, EXTRACT_LIST, TYPE, SCROLL, WAIT, STOP.",
+        "Use only these action types: QUERY, CLICK, EXTRACT, EXTRACT_LIST, TYPE, SCROLL, WAIT, ASK_USER, STOP.",
         "Choose selectors from the provided interactive elements when possible.",
         "Mark risky or page-changing actions with higher risk and requiresConfirmation=true.",
         "For mode=interactive, always require confirmation.",
         "For mode=ask, require confirmation for actions that change the page.",
-        "For mode=auto, Miru runs your action then asks you again automatically: always output exactly one next concrete step toward the full user goal (e.g. CLICK a search result, SCROLL to a section, EXTRACT_LIST player names). Use STOP only when the goal is done or impossible—do not stop after a single QUERY if the user asked for navigation or bulk extraction.",
+        "For mode=auto, Miru runs every non-ASK_USER action automatically without user approval; set requiresConfirmation=false for those. Always output exactly one next concrete step toward the full user goal (e.g. CLICK a search result, SCROLL to a section, EXTRACT_LIST player names). Use STOP only when the goal is done or impossible—do not stop after a single QUERY if the user asked for navigation or bulk extraction.",
+        "Emit ASK_USER ONLY when truly blocked: the user goal is ambiguous, multiple candidate targets exist with no clear winner, or a choice is required (e.g. which of several search results to open). question must be one sentence; options is a list of short strings (can be empty if free-form). Do not use ASK_USER for confirmation of routine clicks or scrolls.",
         "The extension cannot write arbitrary paths like players.txt; use EXTRACT or EXTRACT_LIST so the user can export data from the panel.",
         "Do not invent hidden elements or unsupported actions.",
         "For EXTRACT actions, every field must include attr: use an HTML attribute name (for example href) when reading that attribute; use an empty string when the value should come from visible text instead of an attribute.",
@@ -369,6 +384,17 @@ function parseAction(response: PlannerModelResponse["action"]): MiruAction {
         fields,
         maxItems,
       };
+    }
+    case "ASK_USER": {
+      const question = assertString(response.question, "ASK_USER question");
+      const optionsRaw = Array.isArray(response.options) ? response.options : [];
+      const options = optionsRaw
+        .map((value) => (typeof value === "string" ? value.trim() : ""))
+        .filter((value) => value.length > 0)
+        .slice(0, 8);
+      return options.length > 0
+        ? { type: "ASK_USER", question, options }
+        : { type: "ASK_USER", question };
     }
     case "STOP":
       return {

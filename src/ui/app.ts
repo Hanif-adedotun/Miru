@@ -3,10 +3,12 @@ import type {
   ChatMessage,
   MiruAction,
   MiruMode,
+  PendingAsk,
   PlannerStreamEvent,
   SessionResponseMessage,
   SessionState,
   SessionStreamEventMessage,
+  WorkflowStep,
 } from "../shared/types.js";
 import { downloadArtifactsCsv, downloadArtifactsPdf, exportBaseFilename } from "./exportDownloads.js";
 
@@ -21,43 +23,79 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#039;");
 }
 
-function formatAction(action?: MiruAction): string {
-  if (!action) {
-    return "Waiting for the next command";
-  }
-
+function actionVerb(action: MiruAction): string {
   switch (action.type) {
     case "QUERY":
-      return `Inspect ${action.selector}`;
+      return "Inspect";
     case "CLICK":
-      return `Click ${action.selector}`;
+      return "Click";
     case "TYPE":
-      return `Type into ${action.selector}`;
+      return "Type";
     case "SCROLL":
-      return `Scroll ${action.direction}`;
+      return "Scroll";
     case "WAIT":
-      return `Wait ${action.durationMs}ms`;
+      return "Wait";
     case "EXTRACT":
-      return `Extract ${action.fields.map((field) => field.name).join(", ")}`;
+      return "Extract";
     case "EXTRACT_LIST":
-      return `Extract list ${action.itemSelector} (${action.fields.map((field) => field.name).join(", ")})`;
+      return "Extract list";
+    case "ASK_USER":
+      return "Ask";
     case "STOP":
-      return `Stop: ${action.reason}`;
+      return "Stop";
     default:
-      return "Unknown command";
+      return "Step";
   }
 }
 
-function summarizeResult(value: unknown): string {
-  if (value === undefined || value === null) {
-    return "No result yet.";
+function actionDetail(action: MiruAction): string {
+  switch (action.type) {
+    case "QUERY":
+    case "CLICK":
+      return action.selector;
+    case "TYPE":
+      return `${action.selector}  ←  ${action.text}`;
+    case "SCROLL":
+      return action.direction === "to"
+        ? `to ${action.amount ?? 0}px`
+        : `${action.direction}${action.amount ? ` · ${action.amount}px` : ""}`;
+    case "WAIT":
+      return `${action.durationMs}ms`;
+    case "EXTRACT":
+      return action.fields.map((field) => field.name).join(", ");
+    case "EXTRACT_LIST":
+      return `${action.itemSelector} → ${action.fields.map((field) => field.name).join(", ")}`;
+    case "ASK_USER":
+      return action.question;
+    case "STOP":
+      return action.reason;
+    default:
+      return "";
+  }
+}
+
+function stepResultTail(step: WorkflowStep): string {
+  if (step.status !== "succeeded") {
+    return "";
   }
 
-  if (typeof value === "string") {
-    return value;
+  const action = step.action;
+  const data = step.resultData as unknown;
+  if (action.type === "EXTRACT_LIST" && data && typeof data === "object" && "rows" in data) {
+    const rows = (data as { rows?: unknown[] }).rows;
+    const count = Array.isArray(rows) ? rows.length : 0;
+    return `${count} row${count === 1 ? "" : "s"}`;
   }
-
-  return JSON.stringify(value);
+  if (action.type === "EXTRACT") {
+    return "1 row";
+  }
+  if (action.type === "QUERY") {
+    return "matched";
+  }
+  if (action.type === "STOP") {
+    return "done";
+  }
+  return "ok";
 }
 
 const iconAuto = `<svg class="mode-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>`;
@@ -72,86 +110,191 @@ function renderModePill(selectedMode: MiruMode): string {
   }).join("");
 }
 
-function defaultMessages(state: SessionState): ChatMessage[] {
-  const fallback: ChatMessage[] = [];
+type TimelineEntry =
+  | { kind: "message"; createdAt: number; data: ChatMessage }
+  | { kind: "step"; createdAt: number; data: WorkflowStep; index: number };
 
-  if (state.lastResult) {
-    fallback.push({
-      id: `result-${state.updatedAt}`,
-      role: "assistant",
-      content: `Result: ${summarizeResult(state.lastResult.result ?? state.lastResult.error)}`,
-      status: state.lastResult.success ? "complete" : "error",
-      createdAt: state.updatedAt,
-    });
+/**
+ * Merge chat messages + workflow steps into a single ordered timeline. Step-tied
+ * "Running …"/"Done …" assistant chat messages are dropped (the step row carries that signal).
+ * Assistant messages tied to ASK_USER steps are preserved as clarification pills.
+ */
+function buildTimeline(state: SessionState): TimelineEntry[] {
+  const steps = state.workflowSteps ?? [];
+  const stepById = new Map<string, WorkflowStep>(steps.map((step) => [step.id, step]));
+  const entries: TimelineEntry[] = [];
+
+  for (const message of state.chatMessages ?? []) {
+    const related = message.relatedStepId ? stepById.get(message.relatedStepId) : undefined;
+    if (
+      message.role === "assistant" &&
+      related &&
+      related.action.type !== "ASK_USER" &&
+      message.id !== related.id
+    ) {
+      // Drop redundant "Running …" / "Done …" assistant pings; the step row shows status.
+      continue;
+    }
+    entries.push({ kind: "message", createdAt: message.createdAt, data: message });
   }
 
-  if (fallback.length === 0) {
-    fallback.push({
-      id: "assistant-welcome",
-      role: "assistant",
-      content: "What should I do on this page?",
-      status: "complete",
-      createdAt: Date.now(),
-    });
+  let stepIndex = 0;
+  for (const step of steps) {
+    stepIndex += 1;
+    if (step.action.type === "ASK_USER") {
+      continue;
+    }
+    entries.push({ kind: "step", createdAt: step.createdAt, data: step, index: stepIndex });
   }
 
-  return fallback;
+  return entries.sort((a, b) => a.createdAt - b.createdAt);
 }
 
-function renderMessages(state: SessionState): string {
-  const messages = (state.chatMessages && state.chatMessages.length > 0 ? state.chatMessages : defaultMessages(state)).slice(
-    -40
-  );
+function renderStepRow(entry: { data: WorkflowStep; index: number }): string {
+  const step = entry.data;
+  const status = step.status;
+  const verb = actionVerb(step.action);
+  const detail = actionDetail(step.action);
+  const tail = stepResultTail(step);
+  const kicker = `Step ${String(entry.index).padStart(2, "0")}`;
+  return `
+    <article class="timeline-entry entry-step status-${status}">
+      <span class="step-dot" aria-hidden="true"></span>
+      <div class="step-body">
+        <div class="step-kicker">${escapeHtml(kicker)}</div>
+        <div class="step-line">
+          <span class="step-verb">${escapeHtml(verb)}</span>
+          <code class="step-detail">${escapeHtml(detail)}</code>
+        </div>
+        ${tail ? `<div class="step-tail">${escapeHtml(tail)}</div>` : ""}
+      </div>
+    </article>
+  `;
+}
 
-  return messages
-    .map((message) => {
-      const roleClass = `message-${message.role}`;
-      const statusText =
-        message.status === "thinking"
-          ? "Thinking"
-          : message.status === "running"
-            ? "Running"
-            : message.status === "error"
-              ? "Error"
-              : "";
+function renderClarificationPill(
+  message: ChatMessage,
+  pendingAsk: PendingAsk | undefined
+): string {
+  const isLive = pendingAsk && pendingAsk.stepId === message.relatedStepId;
+  const options = isLive && pendingAsk?.options ? pendingAsk.options : [];
+  const chips =
+    options.length > 0
+      ? `<div class="ask-options">${options
+          .map(
+            (option) =>
+              `<button type="button" class="ask-chip" data-ask-option="${escapeHtml(option)}">${escapeHtml(option)}</button>`
+          )
+          .join("")}</div>`
+      : "";
+  return `
+    <article class="timeline-entry entry-message role-assistant is-clarification${isLive ? " is-live" : ""}">
+      <div class="message-pill">
+        <div class="pill-kicker">Miru needs your input</div>
+        <p class="message-copy">${escapeHtml(message.content)}</p>
+        ${chips}
+      </div>
+    </article>
+  `;
+}
 
-      const errorClass = message.status === "error" ? " is-error" : "";
+function renderMessageRow(
+  message: ChatMessage,
+  state: SessionState
+): string {
+  if (
+    message.role === "assistant" &&
+    message.relatedStepId &&
+    (state.workflowSteps ?? []).some(
+      (step) => step.id === message.relatedStepId && step.action.type === "ASK_USER"
+    )
+  ) {
+    return renderClarificationPill(message, state.pendingAsk);
+  }
 
-      return `
-        <article class="message-row ${roleClass}${errorClass}">
-          <div class="message-bubble">
-            <p class="message-copy ${message.status === "thinking" ? "is-streaming" : ""}">${escapeHtml(message.content)}</p>
-            ${statusText ? `<div class="message-status">${escapeHtml(statusText)}</div>` : ""}
-          </div>
-        </article>
-      `;
-    })
+  if (message.role === "user") {
+    return `
+      <article class="timeline-entry entry-message role-user">
+        <div class="message-pill">
+          <p class="message-copy">${escapeHtml(message.content)}</p>
+        </div>
+      </article>
+    `;
+  }
+
+  if (message.role === "system") {
+    return `
+      <article class="timeline-entry entry-message role-system">
+        <div class="message-pill is-system">
+          <p class="message-copy">${escapeHtml(message.content)}</p>
+        </div>
+      </article>
+    `;
+  }
+
+  const isStreaming = message.status === "thinking";
+  const isError = message.status === "error";
+  return `
+    <article class="timeline-entry entry-message role-assistant${isError ? " is-error" : ""}${isStreaming ? " is-streaming" : ""}">
+      <div class="message-pill">
+        <div class="pill-kicker">Miru</div>
+        <p class="message-copy${isStreaming ? " is-streaming" : ""}">${escapeHtml(message.content)}</p>
+      </div>
+    </article>
+  `;
+}
+
+function renderTimeline(state: SessionState): string {
+  const entries = buildTimeline(state);
+  if (entries.length === 0) {
+    return `
+      <article class="timeline-entry entry-message role-assistant">
+        <div class="message-pill">
+          <div class="pill-kicker">Miru</div>
+          <p class="message-copy">What should I do on this page?</p>
+        </div>
+      </article>
+    `;
+  }
+
+  return entries
+    .map((entry) =>
+      entry.kind === "step" ? renderStepRow(entry) : renderMessageRow(entry.data, state)
+    )
     .join("");
 }
 
-function textareaValue(_state: SessionState): string {
-  // Composer stays empty; chat history holds user messages (state.prompt is kept for the planner).
-  return "";
+function stateStripContent(state: SessionState): { label: string; tone: string; approve: boolean } | null {
+  switch (state.status) {
+    case "planning":
+      return { label: "Miru is thinking", tone: "thinking", approve: false };
+    case "executing":
+      return { label: "Running step", tone: "running", approve: false };
+    case "awaiting_input":
+      return { label: "Miru is asking you a question", tone: "input", approve: false };
+    case "awaiting_approval":
+      return { label: "Waiting for your approval", tone: "approval", approve: true };
+    case "capturing":
+      return { label: "Reading the page", tone: "thinking", approve: false };
+    default:
+      return null;
+  }
 }
 
-function renderStructuredNextStep(state: SessionState): string {
-  const pending = state.pendingAction;
-  if (!pending) {
+function renderStateStrip(state: SessionState): string {
+  const content = stateStripContent(state);
+  if (!content) {
     return "";
   }
-
-  const needsApproval = pending.requiresConfirmation || state.status === "awaiting_approval";
-  const approvalNote = needsApproval
-    ? `<p class="next-step-note">This step needs your approval before it runs.</p>`
+  const approveBtn = content.approve
+    ? `<button type="button" id="approveBtn" class="state-approve">Approve</button>`
     : "";
-
   return `
-    <aside class="next-step-card" aria-label="Structured next command">
-      <div class="next-step-kicker">Next step (what will run)</div>
-      <p class="next-step-command">${escapeHtml(formatAction(pending.action))}</p>
-      <p class="next-step-rationale">${escapeHtml(pending.rationale)}</p>
-      ${approvalNote}
-    </aside>
+    <div class="state-strip tone-${content.tone}" role="status">
+      <span class="state-dot" aria-hidden="true"></span>
+      <span class="state-label">${escapeHtml(content.label)}</span>
+      ${approveBtn}
+    </div>
   `;
 }
 
@@ -174,18 +317,31 @@ function renderExportToolbar(state: SessionState): string {
   `;
 }
 
+function composerPlaceholder(state: SessionState): string {
+  if (state.status === "awaiting_input" && state.pendingAsk) {
+    return `Answer Miru — ${state.pendingAsk.question}`;
+  }
+  if (state.status === "awaiting_approval") {
+    return "Refine, or press Approve above";
+  }
+  return "Message Miru";
+}
+
 function renderApp(state: SessionState, selectedMode: MiruMode): string {
   const busy = ["capturing", "planning", "executing"].includes(state.status);
   const mode = selectedMode;
+  const placeholder = composerPlaceholder(state);
 
   return `
     <div class="viewport">
       <div class="panel">
-        ${renderStructuredNextStep(state)}
         <div class="thread-scroll">
-          ${renderMessages(state)}
+          <div class="timeline">
+            ${renderTimeline(state)}
+          </div>
         </div>
         <div class="composer-stack">
+          ${renderStateStrip(state)}
           ${renderExportToolbar(state)}
           <div class="mode-float">
             <div class="mode-pill-track" role="group" aria-label="Mode">
@@ -195,7 +351,7 @@ function renderApp(state: SessionState, selectedMode: MiruMode): string {
           <div class="input-card">
             <label class="sr-only" for="promptInput">Message</label>
             <div class="input-body">
-              <textarea id="promptInput" rows="1" placeholder="Message Miru" spellcheck="false">${escapeHtml(textareaValue(state))}</textarea>
+              <textarea id="promptInput" rows="1" placeholder="${escapeHtml(placeholder)}" spellcheck="false"></textarea>
               <button id="sendBtn" class="send-btn" type="button" ${busy ? "disabled" : ""} aria-label="Send">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
               </button>
@@ -305,6 +461,28 @@ export function initMiruApp(root: HTMLElement): void {
     updatedAt: Date.now(),
   };
 
+  const submitAnswer = async (answer: string): Promise<void> => {
+    const stepId = state.pendingAsk?.stepId;
+    if (!stepId || !answer.trim()) {
+      return;
+    }
+    state = await sendRuntimeMessage("RESPOND_TO_ASK", { stepId, answer: answer.trim() });
+  };
+
+  const submitPrompt = async (text: string): Promise<void> => {
+    if (!state.id || state.status === "idle") {
+      state = await sendRuntimeMessage("START_SESSION", {
+        prompt: text || DEFAULT_PROMPT,
+        mode: selectedMode,
+      });
+      return;
+    }
+    state = await sendRuntimeMessage("PLAN_NEXT_ACTION", {
+      userMessage: text || undefined,
+      mode: selectedMode,
+    });
+  };
+
   const render = (): void => {
     root.innerHTML = renderApp({ ...state, mode: selectedMode }, selectedMode);
     const thread = root.querySelector<HTMLElement>(".thread-scroll");
@@ -330,6 +508,35 @@ export function initMiruApp(root: HTMLElement): void {
       });
     }
 
+    root.querySelectorAll<HTMLButtonElement>("[data-ask-option]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const option = button.dataset.askOption ?? "";
+        void (async () => {
+          try {
+            await submitAnswer(option);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : "Request failed.";
+            state = { ...state, status: "error", lastError: msg };
+          }
+          selectedMode = normalizeMode(state.mode);
+          render();
+        })();
+      });
+    });
+
+    root.querySelector<HTMLButtonElement>("#approveBtn")?.addEventListener("click", () => {
+      void (async () => {
+        try {
+          state = await sendRuntimeMessage("APPROVE_PENDING_ACTION");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Request failed.";
+          state = { ...state, status: "error", lastError: msg };
+        }
+        selectedMode = normalizeMode(state.mode);
+        render();
+      })();
+    });
+
     const send = async (): Promise<void> => {
       const promptInput = root.querySelector<HTMLTextAreaElement>("#promptInput");
       const text = (promptInput?.value ?? "").trim();
@@ -338,18 +545,10 @@ export function initMiruApp(root: HTMLElement): void {
       }
 
       try {
-        if (state.status === "awaiting_approval" && state.pendingAction) {
-          state = await sendRuntimeMessage("APPROVE_PENDING_ACTION");
-        } else if (!state.id || state.status === "idle") {
-          state = await sendRuntimeMessage("START_SESSION", {
-            prompt: text || DEFAULT_PROMPT,
-            mode: selectedMode,
-          });
+        if (state.status === "awaiting_input" && state.pendingAsk && text) {
+          await submitAnswer(text);
         } else {
-          state = await sendRuntimeMessage("PLAN_NEXT_ACTION", {
-            userMessage: text || undefined,
-            mode: selectedMode,
-          });
+          await submitPrompt(text);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Request failed.";

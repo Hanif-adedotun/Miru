@@ -21,10 +21,12 @@ import type {
   MiruAction,
   MiruMode,
   PageContext,
+  PendingAsk,
   PlannerStreamEvent,
   ProposedAction,
   PlannerRequest,
   RecordedSession,
+  RespondToAskPayload,
   ScrapeArtifact,
   SessionEvent,
   SessionResponseMessage,
@@ -65,6 +67,7 @@ function createEmptySession(): SessionState {
     ],
     isRecording: false,
     scrapeArtifacts: [],
+    pendingAsk: undefined,
     updatedAt: Date.now(),
   };
 }
@@ -272,6 +275,9 @@ function workflowStepTitle(action: MiruAction): string {
   if (action.type === "EXTRACT_LIST") {
     return "Extract list";
   }
+  if (action.type === "ASK_USER") {
+    return "Ask user";
+  }
   return action.type;
 }
 
@@ -367,6 +373,8 @@ function actionToScript(action: MiruAction): string {
       return `await extract(${JSON.stringify(action.fields, null, 2)});`;
     case "EXTRACT_LIST":
       return `await extractList(${JSON.stringify(action.itemSelector)}, ${JSON.stringify(action.fields, null, 2)}, ${JSON.stringify(action.maxItems ?? null)});`;
+    case "ASK_USER":
+      return `// askUser(${JSON.stringify(action.question)}, ${JSON.stringify(action.options ?? [])});`;
     case "STOP":
       return `return { stopped: true, reason: ${JSON.stringify(action.reason)} };`;
     default:
@@ -502,6 +510,10 @@ async function capturePageContext(tab: chrome.tabs.Tab): Promise<PageContext> {
 }
 
 function shouldAutoExecute(mode: MiruMode, action: ProposedAction): boolean {
+  if (action.action.type === "ASK_USER") {
+    return false;
+  }
+
   if (mode === "interactive") {
     return false;
   }
@@ -510,12 +522,56 @@ function shouldAutoExecute(mode: MiruMode, action: ProposedAction): boolean {
     return action.risk === "low" && !action.requiresConfirmation;
   }
 
-  return !action.requiresConfirmation || action.risk !== "high";
+  return true;
 }
 
 function lastWorkflowStep(session: SessionState): WorkflowStep | undefined {
   const steps = session.workflowSteps ?? [];
   return steps[steps.length - 1];
+}
+
+/**
+ * Route an ASK_USER pending action: it never goes to the page. Mark the step as
+ * skipped (pending answer), clear pendingAction, surface pendingAsk so the UI
+ * can prompt the user. The next message from the user resumes planning.
+ */
+async function routeAskUser(session: SessionState): Promise<SessionState> {
+  const action = session.pendingAction;
+  if (!action || action.action.type !== "ASK_USER") {
+    return session;
+  }
+
+  const ask: PendingAsk = {
+    stepId: action.id,
+    question: action.action.question,
+    options: action.action.options,
+    createdAt: Date.now(),
+  };
+
+  let next: SessionState = {
+    ...session,
+    status: "awaiting_input",
+    pendingAction: undefined,
+    pendingAsk: ask,
+    workflowSteps: updateStepStatus(
+      session.workflowSteps,
+      action.id,
+      "skipped",
+      ask.question,
+      ask
+    ),
+    history: [
+      ...session.history,
+      makeEvent("Miru needs input", ask.question, "warning"),
+    ],
+  };
+
+  next = appendChatMessages(
+    next,
+    createChatMessage("assistant", ask.question, "complete", action.id)
+  );
+
+  return saveSession(next);
 }
 
 /**
@@ -539,6 +595,11 @@ async function runAutoModeContinuation(session: SessionState): Promise<SessionSt
     current = await planForSession(current);
 
     if (current.status === "error" || !current.pendingAction) {
+      return current;
+    }
+
+    if (current.pendingAction.action.type === "ASK_USER") {
+      current = await routeAskUser(current);
       return current;
     }
 
@@ -702,12 +763,19 @@ async function planForSession(session: SessionState): Promise<SessionState> {
     streamingSession = setMessageStatus(streamingSession, streamMessageId, "complete");
     streamingSession = await saveSession(streamingSession);
 
+    const isAsk = proposedAction.action.type === "ASK_USER";
+    const willAutoRun = !isAsk && shouldAutoExecute(streamingSession.mode, proposedAction);
+    const nextStatus: SessionState["status"] = isAsk
+      ? "awaiting_input"
+      : willAutoRun
+        ? "executing"
+        : "awaiting_approval";
     const workflowStep: WorkflowStep = {
       id: proposedAction.id,
       action: proposedAction.action,
       title: workflowStepTitle(proposedAction.action),
       rationale: proposedAction.rationale,
-      status: shouldAutoExecute(session.mode, proposedAction) ? "running" : "planned",
+      status: willAutoRun ? "running" : "planned",
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -717,13 +785,13 @@ async function planForSession(session: SessionState): Promise<SessionState> {
         id: sessionId,
         pendingAction: proposedAction,
         workflowSteps: [...(streamingSession.workflowSteps ?? []), workflowStep],
-        status: shouldAutoExecute(streamingSession.mode, proposedAction) ? "executing" : "awaiting_approval",
+        status: nextStatus,
         history: [
           ...streamingSession.history,
           makeEvent(
-            "Next action ready",
+            isAsk ? "Miru needs input" : "Next action ready",
             proposedAction.rationale,
-            proposedAction.requiresConfirmation ? "warning" : "info"
+            proposedAction.requiresConfirmation || isAsk ? "warning" : "info"
           ),
         ],
       }
@@ -845,6 +913,7 @@ async function startSession(payload: StartSessionPayload): Promise<SessionState>
         history: [makeEvent("Session started", `Mode: ${payload.mode}`, "info")],
         workflowSteps: [],
         scrapeArtifacts: [],
+        pendingAsk: undefined,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       })),
@@ -863,9 +932,13 @@ async function startSession(payload: StartSessionPayload): Promise<SessionState>
   session = await saveSession({ ...session, status: "planning" });
   session = await planForSession(session);
 
-  if (session.status !== "error" && session.pendingAction && shouldAutoExecute(session.mode, session.pendingAction)) {
-    session = await executePendingAction(session);
-    session = await runAutoModeContinuation(session);
+  if (session.status !== "error" && session.pendingAction) {
+    if (session.pendingAction.action.type === "ASK_USER") {
+      session = await routeAskUser(session);
+    } else if (shouldAutoExecute(session.mode, session.pendingAction)) {
+      session = await executePendingAction(session);
+      session = await runAutoModeContinuation(session);
+    }
   }
 
   return session;
@@ -933,7 +1006,7 @@ chrome.runtime.onMessage.addListener(
           const text = payload.userMessage.trim();
           session = await saveSession(
             appendChatMessages(
-              { ...session, prompt: text },
+              { ...session, prompt: text, pendingAsk: undefined },
               createChatMessage("user", text, "complete")
             )
           );
@@ -942,12 +1015,53 @@ chrome.runtime.onMessage.addListener(
         const planned = await planForSession(session);
         if (
           planned.status !== "error" &&
-          planned.pendingAction &&
-          shouldAutoExecute(planned.mode, planned.pendingAction)
+          planned.pendingAction
         ) {
-          let after = await executePendingAction(planned);
-          after = await runAutoModeContinuation(after);
-          await saveSession(after);
+          if (planned.pendingAction.action.type === "ASK_USER") {
+            await routeAskUser(planned);
+          } else if (shouldAutoExecute(planned.mode, planned.pendingAction)) {
+            let after = await executePendingAction(planned);
+            after = await runAutoModeContinuation(after);
+            await saveSession(after);
+          }
+        }
+      });
+      return true;
+    }
+
+    if (message.type === "RESPOND_TO_ASK") {
+      void respondWithSession(async () => {
+        const payload = (message.payload ?? {}) as RespondToAskPayload;
+        const answer = payload.answer?.trim();
+        if (!answer) {
+          return;
+        }
+
+        let session = await getStoredSession();
+        session = await saveSession(
+          appendChatMessages(
+            {
+              ...session,
+              prompt: answer,
+              pendingAsk: undefined,
+              status: "planning",
+            },
+            createChatMessage("user", answer, "complete", payload.stepId)
+          )
+        );
+
+        const planned = await planForSession(session);
+        if (
+          planned.status !== "error" &&
+          planned.pendingAction
+        ) {
+          if (planned.pendingAction.action.type === "ASK_USER") {
+            await routeAskUser(planned);
+          } else if (shouldAutoExecute(planned.mode, planned.pendingAction)) {
+            let after = await executePendingAction(planned);
+            after = await runAutoModeContinuation(after);
+            await saveSession(after);
+          }
         }
       });
       return true;

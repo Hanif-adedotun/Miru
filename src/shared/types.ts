@@ -9,6 +9,7 @@ export type SessionStatus =
   | "capturing"
   | "planning"
   | "awaiting_approval"
+  | "awaiting_input"
   | "ready"
   | "executing"
   | "complete"
@@ -62,6 +63,7 @@ export type MiruAction =
   | { type: "TYPE"; selector: string; text: string }
   | { type: "SCROLL"; direction: "up" | "down" | "to"; amount?: number }
   | { type: "WAIT"; durationMs: number }
+  | { type: "ASK_USER"; question: string; options?: string[] }
   | { type: "STOP"; reason: string };
 
 export interface PageContext {
@@ -143,6 +145,14 @@ export interface ChatMessage {
   relatedStepId?: string;
 }
 
+/** Pending clarification request emitted by the planner as ASK_USER. */
+export interface PendingAsk {
+  stepId: string;
+  question: string;
+  options?: string[];
+  createdAt: number;
+}
+
 export interface RecordedSession {
   id: string;
   prompt: string;
@@ -166,6 +176,8 @@ export interface SessionState {
   workflowSteps?: WorkflowStep[];
   /** Aggregated table-like results from extract steps in this session. */
   scrapeArtifacts?: ScrapeArtifact[];
+  /** Set when Miru needs the user to answer before continuing. Cleared on response. */
+  pendingAsk?: PendingAsk;
   chatMessages?: ChatMessage[];
   isRecording?: boolean;
   recordedSession?: RecordedSession;
@@ -236,6 +248,7 @@ export type MessageType =
   | "START_SESSION"
   | "PLAN_NEXT_ACTION"
   | "APPROVE_PENDING_ACTION"
+  | "RESPOND_TO_ASK"
   | "REFRESH_CONTEXT"
   | "TOGGLE_RECORDING"
   | "EXPORT_SESSION_SCRIPT"
@@ -263,6 +276,12 @@ export interface StartSessionPayload {
 export interface PlanNextActionPayload {
   userMessage?: string;
   mode?: MiruMode;
+}
+
+/** Answer to a pending ASK_USER step. */
+export interface RespondToAskPayload {
+  stepId: string;
+  answer: string;
 }
 
 export interface SessionResponseMessage extends Message {

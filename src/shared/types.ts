@@ -2,6 +2,11 @@
  * Shared type definitions for Miru extension
  */
 
+import type { PageAutomationOverlayPayload } from "./overlay.js";
+import type { RunEnvelope, RunSessionSnapshot } from "./run-protocol.js";
+
+export type { PageAutomationOverlayPayload, PageOverlayPhase } from "./overlay.js";
+
 export type MiruMode = "auto" | "ask" | "interactive";
 
 export type SessionStatus =
@@ -164,6 +169,8 @@ export interface RecordedSession {
 
 export interface SessionState {
   id: string | null;
+  /** Active backend-led run id when using WebSocket orchestration. */
+  runId?: string | null;
   mode: MiruMode;
   prompt: string;
   status: SessionStatus;
@@ -239,16 +246,34 @@ export type PlannerStreamEvent =
       createdAt: number;
     };
 
+export type RunStreamEvent =
+  | PlannerStreamEvent
+  | {
+      type: "run_snapshot";
+      snapshot: RunSessionSnapshot;
+    }
+  | {
+      type: "run_envelope";
+      envelope: RunEnvelope;
+    };
+
 export type MessageType =
   | "PING"
   | "PONG"
   | "GET_PAGE_CONTEXT"
+  | "SET_PAGE_OVERLAY"
   | "EXECUTE_ACTION"
   | "GET_SESSION"
+  | "SYNC_PANEL_OPEN"
+  | "SYNC_RUN"
   | "START_SESSION"
+  | "START_RUN"
   | "PLAN_NEXT_ACTION"
   | "APPROVE_PENDING_ACTION"
+  | "APPROVE_RUN_STEP"
   | "RESPOND_TO_ASK"
+  | "ANSWER_RUN_ASK"
+  | "CANCEL_RUN"
   | "REFRESH_CONTEXT"
   | "TOGGLE_RECORDING"
   | "EXPORT_SESSION_SCRIPT"
@@ -291,12 +316,17 @@ export interface SessionResponseMessage extends Message {
 
 export interface SessionStreamEventMessage extends Message {
   type: "SESSION_STREAM_EVENT";
-  payload: PlannerStreamEvent;
+  payload: RunStreamEvent;
 }
 
 export interface ExecuteActionMessage extends Message {
   type: "EXECUTE_ACTION";
   payload: MiruAction;
+}
+
+export interface SetPageOverlayMessage extends Message {
+  type: "SET_PAGE_OVERLAY";
+  payload: PageAutomationOverlayPayload;
 }
 
 export interface ExportScriptResponseMessage extends Message {

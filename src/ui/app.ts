@@ -1,10 +1,13 @@
-import { DEFAULT_PROMPT } from "../shared/constants.js";
+import { MIRU_USE_WS_RUNS } from "../generated/runtime-config.js";
+import { DEFAULT_PROMPT, SESSION_STORAGE_KEY } from "../shared/constants.js";
+import type { RunSessionSnapshot } from "../shared/run-protocol.js";
 import type {
   ChatMessage,
   MiruAction,
   MiruMode,
   PendingAsk,
   PlannerStreamEvent,
+  RunStreamEvent,
   SessionResponseMessage,
   SessionState,
   SessionStreamEventMessage,
@@ -327,6 +330,163 @@ function composerPlaceholder(state: SessionState): string {
   return "Message Miru";
 }
 
+/**
+ * Compress a URL into a short host + path string for the context banner.
+ * Falls back to the raw URL when parsing fails (chrome://, about:, malformed).
+ */
+function describeUrl(url: string | undefined): string {
+  if (!url) {
+    return "";
+  }
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, "");
+    const path =
+      parsed.pathname && parsed.pathname !== "/" ? parsed.pathname.replace(/\/$/, "") : "";
+    const trimmedPath = path.length > 32 ? `${path.slice(0, 31)}…` : path;
+    return `${host}${trimmedPath}`;
+  } catch {
+    return url.length > 60 ? `${url.slice(0, 59)}…` : url;
+  }
+}
+
+/**
+ * Build a favicon URL using Chrome's own cached favicon store (chrome-extension
+ * `/_favicon/`), which keeps browsing data inside the browser instead of
+ * leaking the visited hostname to a third-party (e.g. Google s2). Requires the
+ * `favicon` permission and `_favicon/*` listed in web_accessible_resources.
+ */
+function faviconFor(url: string | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    const base = chrome.runtime.getURL("/_favicon/");
+    const params = new URLSearchParams({ pageUrl: url, size: "32" });
+    return `${base}?${params.toString()}`;
+  } catch {
+    return null;
+  }
+}
+
+function hasActiveSession(state: SessionState): boolean {
+  return (
+    Boolean(state.id) ||
+    state.status !== "idle" ||
+    (state.workflowSteps?.length ?? 0) > 0 ||
+    (state.chatMessages?.length ?? 0) > 1
+  );
+}
+
+function renderSessionToolbar(state: SessionState): string {
+  if (!hasActiveSession(state)) {
+    return "";
+  }
+
+  const busy = ["capturing", "planning", "executing"].includes(state.status);
+
+  return `
+    <div class="session-toolbar" role="toolbar" aria-label="Session actions">
+      <button
+        type="button"
+        id="resetSessionBtn"
+        class="reset-session-btn"
+        ${busy ? "disabled" : ""}
+        aria-label="Start a new chat"
+        title="Clear this session and start a new chat"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 6h18"/>
+          <path d="M8 6V4h8v2"/>
+          <path d="M19 6l-1 14H6L5 6"/>
+          <path d="M10 11v6"/>
+          <path d="M14 11v6"/>
+        </svg>
+        <span>New chat</span>
+      </button>
+    </div>
+  `;
+}
+
+function renderContextBanner(state: SessionState): string {
+  const context = state.currentContext;
+  const isCapturing = state.status === "capturing";
+
+  if (!context && !isCapturing) {
+    return `
+      <header class="context-banner is-empty" role="status" aria-label="Miru is not viewing a page yet">
+        <span class="context-icon" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/></svg>
+        </span>
+        <div class="context-meta">
+          <div class="context-title">No page captured yet</div>
+          <div class="context-host">Miru will read this tab when you send a prompt</div>
+        </div>
+      </header>
+    `;
+  }
+
+  const title = (context?.title || "Reading the active tab").trim();
+  const url = context?.url ?? "";
+  const host = describeUrl(url);
+  const favicon = faviconFor(url);
+  const safeUrl = url ? escapeHtml(url) : "";
+
+  const iconMarkup = favicon
+    ? `<img class="context-favicon" src="${escapeHtml(favicon)}" alt="" width="16" height="16" referrerpolicy="no-referrer" loading="lazy" />`
+    : `<span class="context-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/></svg></span>`;
+
+  const refreshDisabled = isCapturing ? "disabled" : "";
+  const refreshAria = isCapturing ? "Capturing page context" : "Refresh page context";
+
+  return `
+    <header class="context-banner${isCapturing ? " is-capturing" : ""}" title="${safeUrl}" role="status" aria-live="polite">
+      ${iconMarkup}
+      <div class="context-meta">
+        <div class="context-title">${escapeHtml(title)}</div>
+        <div class="context-host">${host ? escapeHtml(host) : "Reading the active tab"}</div>
+      </div>
+      <button
+        type="button"
+        id="contextRefreshBtn"
+        class="context-refresh"
+        aria-label="${refreshAria}"
+        title="${refreshAria}"
+        ${refreshDisabled}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 12a9 9 0 0 1 15.5-6.36L21 8"/>
+          <path d="M21 3v5h-5"/>
+          <path d="M21 12a9 9 0 0 1-15.5 6.36L3 16"/>
+          <path d="M3 21v-5h5"/>
+        </svg>
+      </button>
+    </header>
+  `;
+}
+
+function renderLoadingShell(): string {
+  return `
+    <div class="viewport">
+      <div class="panel panel-loading">
+        <header class="context-banner is-empty" role="status" aria-busy="true">
+          <span class="context-icon" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/></svg>
+          </span>
+          <div class="context-meta">
+            <div class="context-title">Loading Miru…</div>
+            <div class="context-host">Restoring your session</div>
+          </div>
+        </header>
+      </div>
+    </div>
+  `;
+}
+
 function renderApp(state: SessionState, selectedMode: MiruMode): string {
   const busy = ["capturing", "planning", "executing"].includes(state.status);
   const mode = selectedMode;
@@ -335,12 +495,14 @@ function renderApp(state: SessionState, selectedMode: MiruMode): string {
   return `
     <div class="viewport">
       <div class="panel">
+        ${renderContextBanner(state)}
         <div class="thread-scroll">
           <div class="timeline">
             ${renderTimeline(state)}
           </div>
         </div>
         <div class="composer-stack">
+          ${renderSessionToolbar(state)}
           ${renderStateStrip(state)}
           ${renderExportToolbar(state)}
           <div class="mode-float">
@@ -368,7 +530,28 @@ async function sendRuntimeMessage(type: string, payload?: unknown): Promise<Sess
   return response.payload;
 }
 
-function applyStreamEvent(state: SessionState, event: PlannerStreamEvent): SessionState {
+function applyRunSnapshot(state: SessionState, snapshot: RunSessionSnapshot): SessionState {
+  return {
+    ...state,
+    id: snapshot.id,
+    runId: snapshot.runId,
+    mode: snapshot.mode,
+    prompt: snapshot.prompt,
+    status: snapshot.status,
+    tabId: snapshot.tabId,
+    origin: snapshot.origin,
+    currentContext: snapshot.currentContext,
+    pendingAction: snapshot.pendingAction,
+    pendingAsk: snapshot.pendingAsk,
+    workflowSteps: snapshot.workflowSteps,
+    scrapeArtifacts: snapshot.scrapeArtifacts,
+    chatMessages: snapshot.chatMessages,
+    lastError: snapshot.lastError,
+    updatedAt: snapshot.updatedAt,
+  };
+}
+
+function applyPlannerStreamEvent(state: SessionState, event: PlannerStreamEvent): SessionState {
   const currentMessages = [...(state.chatMessages ?? [])];
   const getIndex = (messageId: string): number => currentMessages.findIndex((item) => item.id === messageId);
 
@@ -442,11 +625,22 @@ function applyStreamEvent(state: SessionState, event: PlannerStreamEvent): Sessi
   return state;
 }
 
+function applyStreamEvent(state: SessionState, event: RunStreamEvent): SessionState {
+  if (event.type === "run_snapshot") {
+    return applyRunSnapshot(state, event.snapshot);
+  }
+  if (event.type === "run_envelope") {
+    return state;
+  }
+  return applyPlannerStreamEvent(state, event);
+}
+
 function normalizeMode(mode: MiruMode): MiruMode {
   return mode === "interactive" ? "ask" : mode;
 }
 
 export function initMiruApp(root: HTMLElement): void {
+  let booted = false;
   let selectedMode: MiruMode = "ask";
   let state: SessionState = {
     id: null,
@@ -461,12 +655,17 @@ export function initMiruApp(root: HTMLElement): void {
     updatedAt: Date.now(),
   };
 
+  root.innerHTML = renderLoadingShell();
+
   const submitAnswer = async (answer: string): Promise<void> => {
     const stepId = state.pendingAsk?.stepId;
     if (!stepId || !answer.trim()) {
       return;
     }
-    state = await sendRuntimeMessage("RESPOND_TO_ASK", { stepId, answer: answer.trim() });
+    state = await sendRuntimeMessage(
+      MIRU_USE_WS_RUNS && state.runId ? "ANSWER_RUN_ASK" : "RESPOND_TO_ASK",
+      { stepId, answer: answer.trim() }
+    );
   };
 
   const submitPrompt = async (text: string): Promise<void> => {
@@ -484,10 +683,43 @@ export function initMiruApp(root: HTMLElement): void {
   };
 
   const render = (): void => {
+    // Preserve transient DOM state across re-renders so live updates (storage,
+    // stream port, background context refresh) don't wipe the user's input or
+    // jerk the scroll position when they're reading earlier messages.
+    const oldInput = root.querySelector<HTMLTextAreaElement>("#promptInput");
+    const inputWasFocused = Boolean(oldInput) && document.activeElement === oldInput;
+    const preservedValue = oldInput?.value ?? "";
+    const preservedSelStart = oldInput?.selectionStart ?? preservedValue.length;
+    const preservedSelEnd = oldInput?.selectionEnd ?? preservedValue.length;
+    const oldThread = root.querySelector<HTMLElement>(".thread-scroll");
+    const oldScrollTop = oldThread?.scrollTop ?? 0;
+    const oldScrollHeight = oldThread?.scrollHeight ?? 0;
+    const oldClientHeight = oldThread?.clientHeight ?? 0;
+    const wasPinnedToBottom =
+      !oldThread || oldScrollHeight - oldClientHeight - oldScrollTop < 32;
+
     root.innerHTML = renderApp({ ...state, mode: selectedMode }, selectedMode);
+
     const thread = root.querySelector<HTMLElement>(".thread-scroll");
     if (thread) {
-      thread.scrollTop = thread.scrollHeight;
+      if (wasPinnedToBottom) {
+        thread.scrollTop = thread.scrollHeight;
+      } else {
+        thread.scrollTop = oldScrollTop;
+      }
+    }
+
+    const newInput = root.querySelector<HTMLTextAreaElement>("#promptInput");
+    if (newInput && preservedValue) {
+      newInput.value = preservedValue;
+    }
+    if (newInput && inputWasFocused) {
+      newInput.focus();
+      try {
+        newInput.setSelectionRange(preservedSelStart, preservedSelEnd);
+      } catch {
+        // Setting a selection range can throw on certain element states; ignore.
+      }
     }
 
     root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((button) => {
@@ -527,9 +759,44 @@ export function initMiruApp(root: HTMLElement): void {
     root.querySelector<HTMLButtonElement>("#approveBtn")?.addEventListener("click", () => {
       void (async () => {
         try {
-          state = await sendRuntimeMessage("APPROVE_PENDING_ACTION");
+          state = await sendRuntimeMessage(
+            MIRU_USE_WS_RUNS && state.runId ? "APPROVE_RUN_STEP" : "APPROVE_PENDING_ACTION",
+            MIRU_USE_WS_RUNS && state.runId && state.pendingAction
+              ? { stepId: state.pendingAction.id }
+              : undefined
+          );
         } catch (err) {
           const msg = err instanceof Error ? err.message : "Request failed.";
+          state = { ...state, status: "error", lastError: msg };
+        }
+        selectedMode = normalizeMode(state.mode);
+        render();
+      })();
+    });
+
+    root.querySelector<HTMLButtonElement>("#resetSessionBtn")?.addEventListener("click", () => {
+      void (async () => {
+        try {
+          state = await sendRuntimeMessage("STOP_SESSION");
+          selectedMode = normalizeMode(state.mode);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Reset failed.";
+          state = { ...state, status: "error", lastError: msg };
+        }
+        render();
+      })();
+    });
+
+    root.querySelector<HTMLButtonElement>("#contextRefreshBtn")?.addEventListener("click", () => {
+      void (async () => {
+        // Optimistic flip to capturing tone so the banner reacts instantly,
+        // before the SW round-trip completes.
+        state = { ...state, status: "capturing" };
+        render();
+        try {
+          state = await sendRuntimeMessage("REFRESH_CONTEXT");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Refresh failed.";
           state = { ...state, status: "error", lastError: msg };
         }
         selectedMode = normalizeMode(state.mode);
@@ -587,6 +854,90 @@ export function initMiruApp(root: HTMLElement): void {
     });
   };
 
+  /**
+   * Replace in-memory state with the persisted session snapshot. Used on panel
+   * open / visibility resume so we never flash the empty default UI over a
+   * real session.
+   */
+  const hydrateFromSession = (incoming: SessionState): void => {
+    state = incoming;
+    selectedMode = normalizeMode(incoming.mode);
+  };
+
+  /**
+   * Patch banner/status fields from storage while a session is already running
+   * in this panel. Skipped until boot completes so we don't render an empty
+   * timeline over a real session during the GET_SESSION race.
+   */
+  const applyLiveSessionUpdate = (incoming: SessionState): boolean => {
+    if (!booted) {
+      return false;
+    }
+
+    if (incoming.id && !state.id) {
+      hydrateFromSession(incoming);
+      return true;
+    }
+
+    const workflowChanged =
+      JSON.stringify(incoming.workflowSteps ?? []) !== JSON.stringify(state.workflowSteps ?? []);
+    const artifactsChanged =
+      JSON.stringify(incoming.scrapeArtifacts ?? []) !== JSON.stringify(state.scrapeArtifacts ?? []);
+    const chatChanged =
+      JSON.stringify(incoming.chatMessages ?? []) !== JSON.stringify(state.chatMessages ?? []);
+    const contextChanged =
+      incoming.currentContext?.url !== state.currentContext?.url ||
+      incoming.currentContext?.title !== state.currentContext?.title ||
+      incoming.currentContext?.timestamp !== state.currentContext?.timestamp;
+    const statusChanged = incoming.status !== state.status;
+    const tabChanged = incoming.tabId !== state.tabId || incoming.origin !== state.origin;
+    const runChanged = incoming.runId !== state.runId;
+    const gateChanged =
+      incoming.pendingAsk !== state.pendingAsk ||
+      incoming.pendingAction !== state.pendingAction ||
+      incoming.lastError !== state.lastError;
+
+    if (
+      !workflowChanged &&
+      !artifactsChanged &&
+      !chatChanged &&
+      !contextChanged &&
+      !statusChanged &&
+      !tabChanged &&
+      !runChanged &&
+      !gateChanged
+    ) {
+      return false;
+    }
+
+    state = {
+      ...state,
+      runId: incoming.runId,
+      currentContext: incoming.currentContext,
+      status: incoming.status,
+      tabId: incoming.tabId,
+      origin: incoming.origin,
+      pendingAsk: incoming.pendingAsk,
+      pendingAction: incoming.pendingAction,
+      lastError: incoming.lastError,
+      workflowSteps: incoming.workflowSteps ?? state.workflowSteps,
+      scrapeArtifacts: incoming.scrapeArtifacts ?? state.scrapeArtifacts,
+      chatMessages: incoming.chatMessages ?? state.chatMessages,
+    };
+    return true;
+  };
+
+  const resyncPanel = async (): Promise<void> => {
+    try {
+      hydrateFromSession(await sendRuntimeMessage("SYNC_PANEL_OPEN"));
+      render();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to restore session.";
+      state = { ...state, status: "error", lastError: msg };
+      render();
+    }
+  };
+
   const boot = async (): Promise<void> => {
     const streamPort = chrome.runtime.connect({ name: "miru-session-stream" });
     streamPort.onMessage.addListener((message: SessionStreamEventMessage) => {
@@ -598,9 +949,60 @@ export function initMiruApp(root: HTMLElement): void {
       render();
     });
 
-    state = await sendRuntimeMessage("GET_SESSION");
-    selectedMode = normalizeMode(state.mode);
+    try {
+      hydrateFromSession(await sendRuntimeMessage("SYNC_PANEL_OPEN"));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to start Miru.";
+      state = {
+        ...state,
+        status: "error",
+        lastError: msg,
+        chatMessages: [
+          ...(state.chatMessages ?? []),
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: msg,
+            status: "error",
+            createdAt: Date.now(),
+          },
+        ],
+      };
+    }
+
+    booted = true;
     render();
+
+    // Live banner / status updates after hydration — never before booted.
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== "session" || !booted) {
+        return;
+      }
+      const update = changes[SESSION_STORAGE_KEY];
+      if (!update || !update.newValue) {
+        return;
+      }
+      const incoming = update.newValue as SessionState;
+      if (applyLiveSessionUpdate(incoming)) {
+        render();
+      }
+    });
+
+    // Panel hidden then shown again without a full document reload (Chrome can
+    // keep the side panel document alive). Re-hydrate so we don't show stale UI.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible" || !booted) {
+        return;
+      }
+      if (MIRU_USE_WS_RUNS) {
+        void sendRuntimeMessage("SYNC_RUN").then((incoming) => {
+          hydrateFromSession(incoming);
+          render();
+        }).catch(() => undefined);
+      } else {
+        void resyncPanel();
+      }
+    });
   };
 
   void boot();

@@ -2,6 +2,7 @@ import Fastify from "fastify";
 
 import { planNextAction, streamAlignedNarration, streamPlanNarration } from "./planner.js";
 import { registerRoutes } from "./routes.js";
+import { registerWebSocketRoutes } from "./ws/register.js";
 import { createStorageAdapter, type StorageAdapter } from "./storage.js";
 import type { PlanRequest, ProposedAction } from "./types.js";
 
@@ -62,5 +63,6 @@ export async function buildApp() {
   });
 
   await registerRoutes(app);
+  await registerWebSocketRoutes(app);
   return app;
 }

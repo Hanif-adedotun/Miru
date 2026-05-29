@@ -77,6 +77,14 @@ npm run dev
 
 ## API Contract
 
+### `GET /v1/runs/ws` (WebSocket)
+
+Bidirectional run orchestration (protocol v1 in `src/shared/run-protocol.ts`). The Chrome extension connects from the service worker; the backend drives plan→execute cycles until the run completes.
+
+Client messages: `client.hello`, `client.run.start`, `client.run.resume`, `client.context.snapshot`, `client.context.screenshot`, `client.action.result`, `client.run.approve`, `client.user.answer`, `client.run.cancel`.
+
+Server messages: `server.run.started`, `server.context.request`, `server.step.*`, `server.overlay.command`, `server.chat.*`, `server.run.awaiting_approval`, `server.ask.user`, `server.run.completed`, `server.run.error`.
+
 ### `GET /health`
 
 Returns the service status and whether persistence is using Supabase or memory.

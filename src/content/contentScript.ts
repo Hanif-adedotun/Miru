@@ -19,6 +19,8 @@ import {
   HIGHLIGHT_STYLE_ID,
   MESSAGE_SOURCE,
 } from "../shared/constants.js";
+import type { PageAutomationOverlayPayload } from "../shared/overlay.js";
+import { applyPageOverlay, teardownPageOverlay } from "./pageOverlay.js";
 
 function buildSelector(element: Element): string {
   if (element.id) {
@@ -342,6 +344,20 @@ chrome.runtime.onMessage.addListener(
           success: true,
           result: getPageContext(),
         },
+      });
+      return true;
+    }
+
+    if (message.type === "SET_PAGE_OVERLAY") {
+      const payload = message.payload as PageAutomationOverlayPayload;
+      if (payload?.active) {
+        applyPageOverlay(payload);
+      } else {
+        teardownPageOverlay();
+      }
+      sendResponse({
+        type: "ACTION_RESULT",
+        payload: { success: true, result: { overlay: payload?.active ?? false } },
       });
       return true;
     }

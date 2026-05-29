@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Miru",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AI-driven browser agent for natural language instructions",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "tabs",
-    "sidePanel"
+    "sidePanel",
+    "favicon"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -36,5 +37,10 @@
     "48": "public/icon48.png",
     "128": "public/icon128.png"
   },
-  "web_accessible_resources": []
+  "web_accessible_resources": [
+    {
+      "resources": ["_favicon/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

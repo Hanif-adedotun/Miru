@@ -195,6 +195,30 @@ const plannerResponseSchema = {
   },
 } as const;
 
+function summarizeAction(action: MiruAction): string {
+  switch (action.type) {
+    case "QUERY":
+    case "CLICK":
+      return `${action.type} ${action.selector}`;
+    case "TYPE":
+      return `TYPE ${action.selector} ← ${truncate(action.text, 80)}`;
+    case "SCROLL":
+      return `SCROLL ${action.direction}${action.amount !== undefined && action.amount !== null ? ` ${action.amount}` : ""}`;
+    case "WAIT":
+      return `WAIT ${action.durationMs}ms`;
+    case "EXTRACT":
+      return `EXTRACT [${action.fields.map((f) => f.name).join(", ")}]`;
+    case "EXTRACT_LIST":
+      return `EXTRACT_LIST ${action.itemSelector} → [${action.fields.map((f) => f.name).join(", ")}]`;
+    case "ASK_USER":
+      return `ASK_USER ${truncate(action.question, 80)}`;
+    case "STOP":
+      return `STOP ${truncate(action.reason, 80)}`;
+    default:
+      return "unknown";
+  }
+}
+
 function buildPlannerMessages(request: PlanRequest) {
   const context = request.context;
   const summarizedElements = context.interactiveElements.map((element, index) => ({
@@ -204,6 +228,21 @@ function buildPlannerMessages(request: PlanRequest) {
     tagName: element.tagName,
     role: element.role ?? null,
   }));
+
+  // Compact view of recent workflow steps so the planner can apply STOP
+  // discipline (e.g. "extract goal not yet satisfied because no EXTRACT step
+  // has succeeded yet") and follow-up rules (e.g. "TYPE was the last step, so
+  // CLICK the search button next").
+  const recentSteps = (request.workflowSteps ?? []).slice(-8).map((step) => ({
+    type: step.action.type,
+    status: step.status,
+    summary: summarizeAction(step.action),
+    result: step.resultSummary ? truncate(step.resultSummary, 160) : undefined,
+  }));
+  const lastStep = recentSteps[recentSteps.length - 1];
+  const goalSatisfied = recentSteps.some(
+    (step) => (step.type === "EXTRACT" || step.type === "EXTRACT_LIST") && step.status === "succeeded"
+  );
 
   return [
     {
@@ -217,8 +256,18 @@ function buildPlannerMessages(request: PlanRequest) {
         "Choose selectors from the provided interactive elements when possible.",
         "Mark risky or page-changing actions with higher risk and requiresConfirmation=true.",
         "For mode=interactive, always require confirmation.",
-        "For mode=ask, require confirmation for actions that change the page.",
-        "For mode=auto, Miru runs every non-ASK_USER action automatically without user approval; set requiresConfirmation=false for those. Always output exactly one next concrete step toward the full user goal (e.g. CLICK a search result, SCROLL to a section, EXTRACT_LIST player names). Use STOP only when the goal is done or impossible—do not stop after a single QUERY if the user asked for navigation or bulk extraction.",
+        "For mode=ask, require confirmation only for actions that change the page (CLICK on a submit/destructive control, TYPE into a form, navigation). Read-only actions (QUERY, EXTRACT, EXTRACT_LIST, SCROLL, WAIT) must have requiresConfirmation=false so they auto-run in the chain.",
+        "For mode=auto, Miru runs every non-ASK_USER action automatically without user approval; set requiresConfirmation=false for those.",
+        "REGARDLESS OF MODE, always output exactly one next concrete step toward the full user goal (e.g. CLICK a search result, SCROLL to a section, EXTRACT_LIST listing fields). The extension's service worker chains plan→execute→plan automatically after every step until the goal is satisfied; it does NOT stop after the first action. Treat every plan call as 'what is the very next thing to do toward the goal' — never as 'is the whole task done yet'.",
+        // STOP discipline — the most common failure mode is the planner declaring victory
+        // after a single intermediate step (TYPE, CLICK, QUERY) and stalling the loop.
+        "STOP is allowed ONLY when one of these is observably true from the page context or prior history: (a) the user's full goal has been completed end-to-end (for an extraction/summary/list/csv goal this means EXTRACT or EXTRACT_LIST already returned the requested rows in this session's history — the `extractionAlreadySucceeded` signal in the user message must be true), (b) the goal is impossible from the current page (required element missing, permission denied, broken site), or (c) the user explicitly asked Miru to stop. If none of these hold, you MUST output another concrete action (CLICK, TYPE, SCROLL, WAIT, EXTRACT, EXTRACT_LIST, QUERY, or ASK_USER) instead of STOP.",
+        "NEVER STOP immediately after a single TYPE, CLICK, SCROLL, QUERY, or WAIT — those are intermediate steps and never satisfy a multi-part user goal on their own. Specifically: a QUERY that only confirms an element exists is NEVER the final step — the very next plan call should EXTRACT or EXTRACT_LIST from that confirmed selector.",
+        // Common follow-up patterns the planner repeatedly misses.
+        "If the previous action was TYPE into a search/query input, the next action is almost always CLICK on the search/submit button, a synthetic Enter via CLICK on the search form's submit control, or a short WAIT for search results to render — typing alone does NOT trigger a search on most sites (e.g. Gmail, GitHub, Google search). Then plan an EXTRACT or EXTRACT_LIST against the rendered results.",
+        "If the previous action was QUERY against a list/grid item selector, the very next action MUST be EXTRACT_LIST using that same selector as itemSelector (do not re-QUERY, do not STOP). Pick the obvious user-visible columns from the page context (e.g. title, price, address, bedrooms, link href).",
+        "If the user prompt asks for data extraction or summarization (any of: \"extract\", \"get\", \"list\", \"into a file\", \"download\", \"save\", \"summarize\", \"summary\", \"csv\", \"json\", \"table\", \"export\", \"scrape\", \"all listings\", \"all items\", \"all rows\", \"all results\"), the goal is not complete until at least one EXTRACT or EXTRACT_LIST step has succeeded against the relevant rendered content. Until that happens, STOP is forbidden.",
+        "If the user prompt has multiple verbs joined by 'and' / 'then' (e.g. \"search X and extract Y\"), every verb must be addressed by at least one corresponding action before STOP.",
         "Emit ASK_USER ONLY when truly blocked: the user goal is ambiguous, multiple candidate targets exist with no clear winner, or a choice is required (e.g. which of several search results to open). question must be one sentence; options is a list of short strings (can be empty if free-form). Do not use ASK_USER for confirmation of routine clicks or scrolls.",
         "The extension cannot write arbitrary paths like players.txt; use EXTRACT or EXTRACT_LIST so the user can export data from the panel.",
         "Do not invent hidden elements or unsupported actions.",
@@ -245,6 +294,12 @@ function buildPlannerMessages(request: PlanRequest) {
           timestamp: context.timestamp,
         },
         history: request.history ?? [],
+        recentSteps,
+        lastStep: lastStep ?? null,
+        // Pre-computed signal for STOP discipline: an extraction-style goal is
+        // only "potentially complete" if at least one EXTRACT/EXTRACT_LIST step
+        // already succeeded in this session.
+        extractionAlreadySucceeded: goalSatisfied,
       }),
     },
   ];
@@ -427,36 +482,159 @@ function buildFallbackPlan(request: PlanRequest): ProposedAction {
   };
 }
 
+const EXTRACTION_PROMPT_KEYWORDS = [
+  "extract",
+  "extracts",
+  "extracted",
+  "extracting",
+  "get all",
+  "get every",
+  "list all",
+  "list every",
+  "summarize",
+  "summary",
+  "into a file",
+  "into csv",
+  "as csv",
+  "to csv",
+  "into json",
+  "as json",
+  "to json",
+  "download",
+  "save",
+  "export",
+  "scrape",
+  "table",
+  "all listings",
+  "all items",
+  "all rows",
+  "all results",
+  "all entries",
+  "all records",
+];
+
+/** True when the user prompt implies "produce structured rows", so a single QUERY/CLICK is never the final step. */
+function isExtractionGoal(prompt: string): boolean {
+  const normalized = prompt.toLowerCase();
+  return EXTRACTION_PROMPT_KEYWORDS.some((kw) => normalized.includes(kw));
+}
+
+function extractionAlreadySatisfied(request: PlanRequest): boolean {
+  return (request.workflowSteps ?? []).some(
+    (step) =>
+      (step.action.type === "EXTRACT" || step.action.type === "EXTRACT_LIST") &&
+      step.status === "succeeded"
+  );
+}
+
+/** Find the last succeeded QUERY's selector so we can hand the planner an obvious EXTRACT_LIST target. */
+function lastSucceededQuerySelector(request: PlanRequest): string | null {
+  const steps = request.workflowSteps ?? [];
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (step.action.type === "QUERY" && step.status === "succeeded") {
+      return step.action.selector;
+    }
+  }
+  return null;
+}
+
+function buildAskForExtractionFields(): MiruAction {
+  return {
+    type: "ASK_USER",
+    question:
+      "Which columns should I pull from each item on this page? (e.g. title, price, address, link)",
+    options: ["title, price, address", "title, link", "all visible fields"],
+  };
+}
+
+/** Run the planner once. Pulled out so we can call it twice (initial + STOP-rejection retry). */
+async function callGroqPlanner(
+  request: PlanRequest,
+  extraSystemNote?: string
+): Promise<PlannerModelResponse> {
+  if (!groq) {
+    throw new Error("GROQ_API_KEY is missing. Add it to backend/.env before starting the backend.");
+  }
+
+  const baseMessages = buildPlannerMessages(request);
+  const messages = extraSystemNote
+    ? [
+        ...baseMessages,
+        {
+          role: "system" as const,
+          content: extraSystemNote,
+        },
+      ]
+    : baseMessages;
+
+  const completion = await groq.chat.completions.create({
+    model: config.groqModel,
+    messages,
+    temperature: 0.2,
+    response_format: {
+      type: "json_schema",
+      json_schema: plannerResponseSchema,
+    },
+  });
+
+  const content = completion.choices[0]?.message?.content;
+  if (!content) {
+    throw new Error("Groq returned an empty planner response.");
+  }
+
+  return JSON.parse(content) as PlannerModelResponse;
+}
+
 export async function planNextAction(request: PlanRequest): Promise<ProposedAction> {
   if (!groq) {
     throw new Error("GROQ_API_KEY is missing. Add it to backend/.env before starting the backend.");
   }
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: config.groqModel,
-      messages: buildPlannerMessages(request),
-      temperature: 0.2,
-      response_format: {
-        type: "json_schema",
-        json_schema: plannerResponseSchema,
-      },
-    });
+    let parsed = await callGroqPlanner(request);
+    const extractionGoal = isExtractionGoal(request.prompt);
+    const goalSatisfied = extractionAlreadySatisfied(request);
 
-    const content = completion.choices[0]?.message?.content;
-    if (!content) {
-      throw new Error("Groq returned an empty planner response.");
+    // STOP discipline enforcement: if the user's prompt is an extraction-style
+    // goal and no EXTRACT/EXTRACT_LIST step has succeeded yet, the planner is
+    // bailing out prematurely. Retry once with an inline corrective system note;
+    // if it STOPs again, hand the user an ASK_USER with column options so the
+    // session can keep moving instead of dead-ending after step 01.
+    if (parsed.action.type === "STOP" && extractionGoal && !goalSatisfied) {
+      console.warn(
+        "[Miru] Planner returned STOP before any extraction succeeded; retrying with anti-STOP nudge."
+      );
+      const querySelector = lastSucceededQuerySelector(request);
+      const nudge = querySelector
+        ? `Your previous STOP is rejected. The user goal "${truncate(request.prompt, 120)}" requires structured rows but no EXTRACT/EXTRACT_LIST has succeeded yet. The last successful QUERY confirmed selector ${JSON.stringify(querySelector)}. Output an EXTRACT_LIST with itemSelector=${JSON.stringify(querySelector)} and a small set of obvious user-visible fields (title, price, link, address — pick what the page actually has). Set risk="low" and requiresConfirmation=false so it auto-runs. Do NOT output STOP.`
+        : `Your previous STOP is rejected. The user goal "${truncate(request.prompt, 120)}" requires structured rows but no EXTRACT/EXTRACT_LIST has succeeded yet. Output a QUERY against the most likely repeating item selector on the page (e.g. a list-item class), or an EXTRACT_LIST if a clear itemSelector is already obvious from the page context. Do NOT output STOP.`;
+      parsed = await callGroqPlanner(request, nudge);
     }
 
-    const parsed = JSON.parse(content) as PlannerModelResponse;
+    let action = parseAction(parsed.action);
+    let rationale = truncate(assertString(parsed.rationale, "rationale"), 240);
+    let requiresConfirmation = Boolean(parsed.requiresConfirmation);
+    let risk: PlannerModelResponse["risk"] = parsed.risk;
+
+    // If the retry still STOPs, fall back to ASK_USER so the user can supply
+    // the missing column hint instead of getting stuck at the previous step.
+    if (action.type === "STOP" && extractionGoal && !goalSatisfied) {
+      console.warn("[Miru] Planner returned STOP twice; falling back to ASK_USER for column hints.");
+      action = buildAskForExtractionFields();
+      rationale =
+        "I want to extract structured rows here but I'm not sure which columns you need. Let me know what to pull from each item.";
+      risk = "low";
+      requiresConfirmation = false;
+    }
 
     return {
       id: createId(),
-      action: parseAction(parsed.action),
-      rationale: truncate(assertString(parsed.rationale, "rationale"), 240),
+      action,
+      rationale,
       confidence: coerceConfidence(parsed.confidence),
-      risk: parsed.risk,
-      requiresConfirmation: Boolean(parsed.requiresConfirmation),
+      risk,
+      requiresConfirmation,
     };
   } catch (error) {
     console.error("[Miru] Groq planner failed, using fallback plan:", error);

@@ -5,6 +5,7 @@ const rootDir = process.cwd();
 const envFiles = [".env", ".env.local"];
 const defaultConfig = {
   MIRU_BACKEND_URL: "http://localhost:3001",
+  MIRU_USE_WS_RUNS: "true",
 };
 
 function parseEnv(contents) {
@@ -47,6 +48,7 @@ fs.writeFileSync(
  */
 
 export const MIRU_BACKEND_URL = ${JSON.stringify(mergedConfig.MIRU_BACKEND_URL)};
+export const MIRU_USE_WS_RUNS = ${mergedConfig.MIRU_USE_WS_RUNS !== "false"};
 `,
   "utf8"
 );

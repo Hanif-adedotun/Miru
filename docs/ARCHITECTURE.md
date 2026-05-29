@@ -3,9 +3,11 @@
 ## Document Status
 
 - Product: Miru
-- Platform: Chrome Extension, Manifest V3
-- Version: Draft 1
-- Date: April 18, 2026
+- Platform: Chrome Extension (Manifest V3) + Fastify backend (Groq + optional Supabase)
+- Version: Draft 2 — implementation snapshot
+- Date: May 16, 2026
+
+> This revision tracks the actual code as of the autonomy + timeline UI work. Sections marked _(implemented)_ describe shipped behavior; sections marked _(aspirational)_ are design targets that are not yet wired up.
 
 ## 1. Goal
 
@@ -22,193 +24,247 @@ Miru should be implemented as a workflow-first browser automation system. The ar
 
 ## 2. Current Repo Shape
 
-The current project already matches a basic MV3 structure:
+The repo is now split into the Chrome extension and a standalone backend service.
 
-- `src/background/serviceWorker.ts`
-- `src/content/contentScript.ts`
-- `src/ui/sidepanel.html`
-- `src/ui/sidepanel.ts`
-- `src/shared/types.ts`
-- `src/manifest.json`
+**Chrome extension (`src/`)**
 
-That is a good foundation, but Miru will need a clearer separation between capture, workflow planning, command execution, routine storage, and policy boundaries.
+- `src/manifest.json` — MV3 manifest.
+- `src/background/serviceWorker.ts` — session orchestration, planner client, action execution, auto-chain loop, scrape-artifact aggregation, recording, and export. Currently a single ~1.2k-line module (see §5 for the planned split).
+- `src/content/contentScript.ts` — DOM inspection and command executor (`QUERY`, `CLICK`, `TYPE`, `SCROLL`, `WAIT`, `EXTRACT`, `EXTRACT_LIST`).
+- `src/ui/sidepanel.html` — side panel shell.
+- `src/ui/sidepanel.ts` — bootstrap that calls `initMiruApp`.
+- `src/ui/app.ts` — timeline thread, state strip, composer, export toolbar.
+- `src/ui/app.css` — design system (Fraunces + Spline Sans + IBM Plex Mono, warm-paper palette, timeline rail, motion).
+- `src/ui/exportDownloads.ts` — CSV + PDF builders backed by `jspdf` and `jspdf-autotable`.
+- `src/shared/types.ts` — wire types shared between SW, content script, and UI.
+- `src/shared/constants.ts` — defaults (prompt, storage keys, message source tag).
+- `src/generated/runtime-config.ts` — backend URL injected at build time by `scripts/generate-extension-config.mjs`.
+
+**Backend (`backend/`)**
+
+- `backend/src/app.ts` — Fastify factory; decorates `app.planner` and `app.storage`; Pino JSON logging.
+- `backend/src/routes.ts` — `GET /health`, `POST /v1/plan`, `POST /v1/plan/stream` (SSE).
+- `backend/src/planner.ts` — Groq client + JSON-schema constrained planner output + aligned narration streamer.
+- `backend/src/storage.ts` — in-memory adapter with optional Supabase persistence (`miru_sessions`, `miru_plans` tables).
+- `backend/src/config.ts`, `loadEnv.ts` — env loading.
+- `backend/src/types.ts` — backend mirror of the planner-facing types.
+
+**Build / packaging**
+
+- `scripts/generate-extension-config.mjs` writes `src/generated/runtime-config.ts`.
+- Root `npm run build` runs `tsc -p tsconfig.build.json`, then bundles the content script and the side panel via `esbuild` (`dist/content/contentScript.js`, `dist/ui/sidepanel.js`), then copies manifest, HTML, and CSS into `dist/`.
+- The side panel must be bundled (not raw ES modules) because `jspdf` / `jspdf-autotable` use bare specifiers that the browser module loader cannot resolve.
 
 ## 3. Recommended V1 Architecture
 
 ### Extension Components
 
-#### Side Panel UI
+#### Side Panel UI _(implemented)_
 
 Responsibilities:
 
-- chat transcript
-- task input
-- task status
-- inline page memory summaries
-- command approval controls
-- workflow timeline
-- recording controls
-- JavaScript export affordance
-- routine save and replay affordances
-- extracted result display
+- unified timeline thread that merges chat messages and workflow steps off a single 1px rail
+- explicit state strip above the composer for `planning`, `executing`, `awaiting_input`, `awaiting_approval`, `capturing`
+- composer behavior split: prompt send vs `RESPOND_TO_ASK` answer vs `APPROVE_PENDING_ACTION` button, with option chips when `pendingAsk.options` is present
+- streaming planner narration (assistant pill that types out as SSE tokens arrive)
+- export toolbar (CSV / PDF) when `scrapeArtifacts` is non-empty
+- mode pill (Auto / Ask) — `interactive` is collapsed into `ask` in the UI
 
 Notes:
 
 - primary Miru shell for task sessions
 - remains visible while the page changes
-- should feel like a compact conversational operator console rather than a dashboard
+- avoids dashboard chrome; behaves like a conversational operator console
+- recording / routine save UI is not yet implemented (the SW already records steps; the affordance is missing)
 
-#### Background Service Worker
+#### Background Service Worker _(implemented)_
 
 Responsibilities:
 
-- session orchestration
-- state transitions
-- permission-aware routing
-- API calls to backend workflow planner
-- chat message creation and update
-- command stream management
-- recording lifecycle management
-- export script generation
-- routine replay coordination
-- retry and error handling
-- storage coordination
+- session lifecycle (`startSession`, `STOP_SESSION`, `RESPOND_TO_ASK`, `APPROVE_PENDING_ACTION`, `PLAN_NEXT_ACTION`, `TOGGLE_RECORDING`, `EXPORT_SESSION_SCRIPT`, `REFRESH_CONTEXT`, `GET_SESSION`)
+- page-context capture (screenshot via `chrome.tabs.captureVisibleTab`, DOM snapshot via content script)
+- planner client over SSE (`/v1/plan/stream`): subscribes to `assistant_token` tokens, surfaces them to the UI through a long-lived port (`miru-session-stream`)
+- action routing: `ASK_USER` → `awaiting_input` + `pendingAsk` (never sent to the page); everything else → `executePendingAction`
+- auto-chain loop (`runAutoModeContinuation`) — after a successful auto-mode step, re-enter plan → execute up to `AUTO_CHAIN_MAX_STEPS = 25` times, stopping on `STOP`, `awaiting_input`, `awaiting_approval`, error, or step cap
+- scrape-artifact aggregation: successful `QUERY` / `EXTRACT` / `EXTRACT_LIST` becomes a `ScrapeArtifact` appended to `SessionState.scrapeArtifacts` (trimmed to 40 artifacts × 1500 rows)
+- recording lifecycle + export script (`buildExportedScript` emits a runnable JS scaffold; `ASK_USER` is a no-op comment)
+- storage: writes the full `SessionState` to `chrome.storage.session` on every mutation; reads on every handler entry
 
 Constraints:
 
 - no DOM access
-- lifecycle is event-driven and non-persistent
-- must persist minimal session state outside in-memory globals
+- event-driven, non-persistent lifecycle — all state lives in `chrome.storage.session`, no in-memory globals beyond ephemeral message ports
 
-#### Content Script
+#### Content Script _(implemented)_
 
 Responsibilities:
 
-- DOM inspection
-- element lookup
-- command execution on the current page
-- visible text extraction
-- element highlighting
+- structured-action executor — handles `QUERY`, `CLICK`, `TYPE`, `SCROLL`, `WAIT`, `EXTRACT`, `EXTRACT_LIST`
+- DOM snapshot for planner context (URL, title, visible-text length, link/form counts, trimmed HTML preview, interactive element summaries)
+- element highlight (`miru-highlighted` class on the last targeted node)
+- auto-mode page overlay (`SET_PAGE_OVERLAY`): banner, target bounding box, and cursor hint while the service worker plans and executes (`src/content/pageOverlay.ts`)
 
 Constraints:
 
-- runs in page context boundaries
-- must avoid unsafe execution patterns
-- should operate from structured command payloads only
+- never evaluates planner-supplied JavaScript
+- operates only on the structured `MiruAction` payloads validated by the SW
+- `ASK_USER` never reaches the content script
 
-#### Remote Backend
+#### Remote Backend (`backend/`) _(implemented)_
 
 Responsibilities:
 
-- authenticate user session
-- receive structured page context
-- run model inference
-- return constrained command output
-- refine workflow state across steps
-- support routine-aware planning and repair
-- log task telemetry if enabled
+- `POST /v1/plan` — synchronous planning (returns one `ProposedAction`)
+- `POST /v1/plan/stream` — plan-first then SSE-stream an aligned narration that describes the already-chosen action, then emit the structured `plan_result` event
+- structured-output planning via Groq with a JSON-schema-constrained response (one `MiruAction` per call, never a multi-step plan, never executable JS)
+- optional Supabase persistence of sessions and plans
+- Pino JSON logging at `LOG_LEVEL` (defaults to `info`)
 
-Critical rule:
+Critical rules:
 
-- backend may return data, plans, workflow suggestions, and model output
-- backend must not return arbitrary executable JavaScript for the extension to run
+- the backend returns data, structured commands, rationale, and narration tokens only
+- the backend must not return JavaScript for the extension to execute
+- the planner emits exactly one next concrete action per call; multi-step plans are not supported by design (the SW's auto-chain loop is what makes goals progress)
+
+Not yet implemented:
+
+- authenticated user sessions (the backend has no auth layer; CORS is wide-open during local dev)
+- routine-aware repair flows (no routine endpoints exist)
+- task telemetry beyond Pino request logs
 
 ## 4. Data Flow
 
-### Workflow Loop
+### WebSocket run loop _(implemented — default when `MIRU_USE_WS_RUNS=true`)_
 
-1. User invokes Miru from the extension action.
-2. Side panel requests a context capture.
-3. Service worker:
-   - verifies active tab access
-   - captures screenshot
-   - requests DOM summary from content script
-4. Service worker builds a normalized workflow payload:
-   - prompt
-   - mode
-   - current page context
-   - prior command history
-   - prior chat messages
-   - prior results
-   - optional routine metadata
-5. Service worker sends the payload to backend planning.
-6. Backend returns a structured next command or workflow refinement response.
-7. Side panel displays the next command and the updated workflow timeline.
-7. Side panel also renders a readable assistant message for the same step.
-8. User approves if required.
-9. Service worker forwards a structured command to the content script.
-10. Content script executes the command and returns a result.
-11. Service worker updates workflow state and triggers the next loop if needed.
+The backend owns the multi-step run. The extension service worker is a **browser gateway** over `GET /v1/runs/ws` (see `src/shared/run-protocol.ts`). Protocol types are mirrored in `backend/src/shared/run-protocol.ts`.
 
-### Routine Replay Loop
+1. User sends a prompt from the side panel → `START_SESSION` / `START_RUN` → [`runGateway.startRun`](src/background/runGateway.ts) opens (or reuses) a WebSocket and sends `client.run.start`.
+2. Backend [`RunOrchestrator`](backend/src/run/orchestrator.ts) creates a run, emits `server.context.request`.
+3. SW captures `PageContext` (+ screenshot, split frame if large) → `client.context.snapshot` / `client.context.screenshot`.
+4. Backend calls `planNextAction`, streams narration (`server.chat.*`), emits `server.step.planned` + `server.overlay.command`.
+5. Approval gates ([`run/gates.ts`](backend/src/run/gates.ts)): auto / ask / interactive — same rules as the legacy SW helpers.
+6. Backend emits `server.step.execute` → SW runs `EXECUTE_ACTION` in the content script → `client.action.result`.
+7. On success, backend emits `server.step.completed`, requests context again, repeats until `STOP`, cancel, error, or `RUN_MAX_STEPS` (50).
+8. SW pushes live UI state via `run_snapshot` on the `miru-session-stream` port; storage listener also syncs `workflowSteps` / `scrapeArtifacts`.
+9. User approve / ask answer → `APPROVE_RUN_STEP` / `ANSWER_RUN_ASK` → `client.run.approve` / `client.user.answer`. Stop → `CANCEL_RUN`.
+
+While a run is active, [`tabs.onUpdated`](src/background/serviceWorker.ts) navigation refresh is deferred so the orchestrator does not race with `status === "capturing"`.
+
+```mermaid
+sequenceDiagram
+  participant UI as SidePanel
+  participant SW as ServiceWorker
+  participant CS as ContentScript
+  participant BE as RunOrchestrator
+
+  UI->>SW: START_RUN
+  SW->>BE: WS client.run.start
+  loop until run complete
+    BE-->>SW: server.context.request
+    SW->>CS: GET_PAGE_CONTEXT
+    SW->>BE: client.context.snapshot
+    BE-->>SW: server.step.planned server.overlay.command
+    alt awaiting approval
+      BE-->>UI: server.run.awaiting_approval
+      UI->>SW: APPROVE_RUN_STEP
+      SW->>BE: client.run.approve
+    end
+    BE-->>SW: server.step.execute
+    SW->>CS: EXECUTE_ACTION
+    SW->>BE: client.action.result
+    BE-->>UI: run_snapshot via port
+  end
+  BE-->>SW: server.run.completed
+```
+
+Set `MIRU_USE_WS_RUNS=false` in `.env` to fall back to the legacy per-step HTTP loop below.
+
+### Legacy HTTP workflow loop _(still available when `MIRU_USE_WS_RUNS=false`)_
+
+1. UI dispatches `START_SESSION` or `PLAN_NEXT_ACTION` / `RESPOND_TO_ASK`.
+2. SW captures page context and `POST`s `/v1/plan/stream` (SSE) once per step.
+3. [`runWorkflowContinuation`](src/background/serviceWorker.ts) chains plan→execute in-process (cap `AUTO_CHAIN_MAX_STEPS = 25`).
+
+This path remains for debugging; new development should target the WebSocket run loop.
+
+### Routine Replay Loop _(aspirational — not yet implemented)_
+
+The data model has `SavedRoutine` and `activeRoutine` slots, but the SW does not yet load, replay, or repair routines. When this lands, the intended flow is:
 
 1. User selects a saved routine.
-2. Service worker loads the routine definition and prior prompt context.
-3. Miru runs the workflow against the current page or origin.
-4. If commands fail due to site drift, backend planning attempts workflow repair within the constrained schema.
-5. Miru surfaces any repaired step for inspection before the routine is updated.
+2. SW loads the routine and previous prompt context.
+3. Miru replays the recorded steps against the current page or origin.
+4. On drift, the SW asks the backend planner for a repair within the constrained schema.
+5. Repaired steps are surfaced for inspection before the routine is updated.
 
-## 5. Suggested Module Boundaries
+## 5. Suggested Module Boundaries _(aspirational — not yet implemented)_
 
-Recommended additions:
+Today the SW is a single ~1.2k-line `src/background/serviceWorker.ts` and the content script is a single `src/content/contentScript.ts`. That is intentional for this iteration (state transitions and the auto-chain loop are easier to reason about in one file), but the planned split — for when the surface area grows — is:
 
-- `src/background/sessionManager.ts`
-- `src/background/plannerClient.ts`
-- `src/background/chatManager.ts`
-- `src/background/workflowManager.ts`
-- `src/background/routineManager.ts`
-- `src/background/exportManager.ts`
-- `src/background/permissionManager.ts`
-- `src/background/screenshot.ts`
-- `src/content/domSnapshot.ts`
-- `src/content/actionExecutor.ts`
-- `src/content/elementLocator.ts`
-- `src/shared/workflows.ts`
-- `src/shared/routines.ts`
-- `src/shared/schemas.ts`
-- `src/shared/messages.ts`
-- `src/shared/sanitizers.ts`
+- `src/background/sessionManager.ts` — session lifecycle, `chrome.storage.session` I/O
+- `src/background/plannerClient.ts` — SSE client + token relay
+- `src/background/chatManager.ts` — chat message construction, streaming token application
+- `src/background/workflowManager.ts` — `WorkflowStep` mutation + auto-chain loop
+- `src/background/routineManager.ts` — saved routine load/replay/repair
+- `src/background/exportManager.ts` — `buildExportedScript` + future replay-as-JS builds
+- `src/background/permissionManager.ts` — active-tab + host-permission probes
+- `src/background/screenshot.ts` — throttled `captureVisibleTab`
+- `src/content/domSnapshot.ts` — `PageContext` builder
+- `src/content/actionExecutor.ts` — per-action handlers
+- `src/content/elementLocator.ts` — selector candidates + fallbacks
+- `src/shared/workflows.ts`, `routines.ts`, `schemas.ts`, `messages.ts`, `sanitizers.ts` — narrower modules in place of the omnibus `shared/types.ts`
 
 ## 6. State Model
 
-### Session State
+### Session State _(implemented)_
 
-Keep session state explicit and serializable:
+The full `SessionState` lives in `chrome.storage.session` under one key and is replaced on every mutation. Source: `src/shared/types.ts`.
 
-- `sessionId`
-- `tabId`
-- `origin`
-- `mode`
-- `prompt`
-- `chatMessages`
-- `latestContext`
-- `lastScreenshotAt`
-- `commandHistory`
-- `workflowSteps`
-- `isRecording`
-- `recordedSession`
-- `lastExportedScript`
-- `lastPlan`
-- `lastExtraction`
-- `status`
-- `lastError`
+```ts
+type SessionStatus =
+  | "idle"
+  | "capturing"
+  | "planning"
+  | "awaiting_approval"
+  | "awaiting_input"
+  | "ready"
+  | "executing"
+  | "complete"
+  | "error";
 
-### Routine State
+interface SessionState {
+  id: string | null;
+  mode: MiruMode;                 // "auto" | "ask" | "interactive"
+  prompt: string;                 // last user prompt for the planner
+  status: SessionStatus;
+  tabId?: number;
+  origin?: string;
+  currentContext?: PageContext;   // last DOM + screenshot snapshot
+  pendingAction?: ProposedAction; // locked next action awaiting execute/approve
+  lastResult?: ActionResultPayload;
+  history: SessionEvent[];        // status/event log surfaced in UI tools
+  workflowSteps?: WorkflowStep[]; // the timeline rendered by the side panel
+  scrapeArtifacts?: ScrapeArtifact[]; // aggregated tabular data from extract steps
+  pendingAsk?: PendingAsk;        // set while status === "awaiting_input"
+  chatMessages?: ChatMessage[];   // user + assistant + system pills
+  isRecording?: boolean;
+  recordedSession?: RecordedSession;
+  lastExportedScript?: string;
+  activeRoutine?: SavedRoutine;
+  lastError?: string;
+  createdAt?: number;
+  updatedAt: number;
+}
+```
 
-Persist saved routines separately from transient sessions:
+Notable runtime constants in `serviceWorker.ts`:
 
-- `routineId`
-- `name`
-- `originPattern`
-- `prompt`
-- `workflowSteps`
-- `lastSuccessfulRunAt`
-- `lastRepairAt`
-- `version`
+- `AUTO_CHAIN_MAX_STEPS = 25` — auto-mode chain cap per user turn.
+- `MAX_SCRAPE_ARTIFACTS = 40`, `MAX_ROWS_PER_SCRAPE_ARTIFACT = 1500` — storage trimming for extract results.
 
-### Suggested Runtime Shapes
+### Runtime Shapes _(implemented)_
 
-Suggested workflow step shape:
+Workflow step:
 
 ```ts
 type WorkflowStepStatus =
@@ -227,12 +283,14 @@ interface WorkflowStep {
   rationale?: string;
   status: WorkflowStepStatus;
   resultSummary?: string;
+  /** Structured result when available (e.g. extraction payloads). */
+  resultData?: unknown;
   createdAt: number;
   updatedAt: number;
 }
 ```
 
-Suggested chat message shape:
+Chat message:
 
 ```ts
 type ChatRole = "user" | "assistant" | "system";
@@ -244,13 +302,47 @@ interface ChatMessage {
   content: string;
   status: ChatMessageStatus;
   createdAt: number;
-  relatedStepId?: string;
+  relatedStepId?: string; // ties "Running…" / "Done…" / clarification pills to a step
 }
 ```
 
-Suggested saved routine shape:
+Pending clarification (set while `status === "awaiting_input"`):
 
 ```ts
+interface PendingAsk {
+  stepId: string;
+  question: string;
+  options?: string[]; // when present, the UI renders option chips
+  createdAt: number;
+}
+```
+
+Scrape artifact (one per successful `QUERY` / `EXTRACT` / `EXTRACT_LIST`):
+
+```ts
+interface ScrapeArtifact {
+  id: string;
+  stepId: string;
+  createdAt: number;
+  source: "QUERY" | "EXTRACT" | "EXTRACT_LIST";
+  label: string;
+  columns: string[];
+  rows: Record<string, string>[];
+}
+```
+
+Recorded session and saved routine shapes:
+
+```ts
+interface RecordedSession {
+  id: string;
+  prompt: string;
+  mode: MiruMode;
+  workflowSteps: WorkflowStep[];
+  startedAt: number;
+  completedAt?: number;
+}
+
 interface SavedRoutine {
   id: string;
   name: string;
@@ -263,19 +355,7 @@ interface SavedRoutine {
 }
 ```
 
-Suggested recorded session shape:
-
-```ts
-interface RecordedSession {
-  id: string;
-  prompt: string;
-  workflowSteps: WorkflowStep[];
-  startedAt: number;
-  completedAt?: number;
-}
-```
-
-Suggested planner payload additions:
+Planner request (sent to backend):
 
 ```ts
 interface PlannerRequest {
@@ -290,50 +370,96 @@ interface PlannerRequest {
 }
 ```
 
-### Storage Recommendation
+### Message Types _(implemented)_
 
-- `chrome.storage.session`: active workflow session state
-- `chrome.storage.local`: settings, consent flags, lightweight routine metadata cache
-- avoid `chrome.storage.sync` for session content or large payloads
+Wire `MessageType` union used by `chrome.runtime.sendMessage` + the long-lived `miru-session-stream` port:
 
-Backend persistence recommendation:
+```
+PING / PONG
+GET_PAGE_CONTEXT / EXECUTE_ACTION
+GET_SESSION / START_SESSION / STOP_SESSION
+PLAN_NEXT_ACTION / APPROVE_PENDING_ACTION / RESPOND_TO_ASK
+REFRESH_CONTEXT / TOGGLE_RECORDING / EXPORT_SESSION_SCRIPT
+SUBSCRIBE_SESSION_STREAM / SESSION_STREAM_EVENT / SESSION_RESPONSE
+EXPORT_SCRIPT_RESPONSE / ACTION_RESULT / ERROR
+```
 
-- database `workflow_runs` table for transient or completed workflow sessions
-- database `workflow_steps` table keyed to a run or routine
-- database `saved_routines` table for replayable workflows
-- database `routine_versions` table for repair history and auditability
+### Storage
 
-Reason:
+Extension side _(implemented)_:
 
-- `storage.session` survives service worker restarts within the browser session and fits MV3 well
-- `storage.local` should be reserved for small persistent settings and lightweight routine references
+- `chrome.storage.session` holds the full `SessionState` under `SESSION_STORAGE_KEY`. Survives SW restarts within the browser session and fits MV3 well.
+- `chrome.storage.local` is reserved for settings / consent / routine metadata — currently unused.
+- `chrome.storage.sync` is intentionally never used (size limits + privacy).
 
-## 7. Command Schema Design
+Backend side _(implemented)_:
 
-Miru should never execute free-form code. Use a narrow schema.
+- `miru_sessions` — latest planner-facing snapshot per session (Supabase).
+- `miru_plans` — append-only log of every `ProposedAction` per session (Supabase).
+- If Supabase env vars are absent, an in-memory adapter is used (`InMemoryStorage` in `backend/src/storage.ts`).
 
-Recommended V1 schema:
+Backend tables that are still aspirational (called out in earlier drafts) — `workflow_runs`, `workflow_steps`, `saved_routines`, `routine_versions` — are not yet created; they correspond to routine save / replay / repair work that has not landed.
+
+## 7. Command Schema Design _(implemented)_
+
+Miru never executes free-form code. The planner is constrained by a JSON schema (`plannerActionOneOf` in `backend/src/planner.ts`) so it can only return one of these variants per call:
 
 ```ts
+interface ExtractionField {
+  name: string;
+  selector: string;
+  attr?: string; // attribute name; absent means "use visible text"
+}
+
+interface ExtractListField {
+  name: string;
+  attr: string; // empty string = visible text of the matched element
+}
+
 type MiruAction =
   | { type: "QUERY"; selector: string }
   | { type: "CLICK"; selector: string }
   | { type: "TYPE"; selector: string; text: string }
   | { type: "SCROLL"; direction: "up" | "down" | "to"; amount?: number }
   | { type: "WAIT"; durationMs: number }
-  | { type: "EXTRACT"; fields: Array<{ name: string; selector: string; attr?: string }> }
+  | { type: "EXTRACT"; fields: ExtractionField[] }
+  | {
+      type: "EXTRACT_LIST";
+      itemSelector: string;
+      fields: ExtractListField[];
+      /** Row cap; omitted / null defaults to 500 in the content script (max 2000). */
+      maxItems?: number | null;
+    }
+  | { type: "ASK_USER"; question: string; options?: string[] }
   | { type: "STOP"; reason: string };
 ```
 
-Recommended later additions:
+Notes on the two recently added variants:
 
-- locator candidates
-- frame hints
-- confidence
-- reason
-- requiresConfirmation
+- **`EXTRACT_LIST`** — `querySelectorAll(itemSelector)` then read each field from each matched element. The content script caps results at `min(maxItems ?? 500, 2000)` and the SW packages the rows as a `ScrapeArtifact` so the UI can offer CSV / PDF download.
+- **`ASK_USER`** — never reaches the content script. The SW routes it to `awaiting_input` + `pendingAsk`; the UI renders a clarification pill (optionally with option chips). The auto-chain loop halts until the user answers via `RESPOND_TO_ASK`.
 
-This schema should represent the atomic command layer, not the entire workflow. Workflows are ordered lists of these constrained commands plus execution metadata.
+Every action is wrapped in a `ProposedAction` with execution metadata that already exists in the code:
+
+```ts
+type ActionRisk = "low" | "medium" | "high";
+
+interface ProposedAction {
+  id: string;
+  action: MiruAction;
+  rationale: string;
+  confidence: number;        // clamped to [0, 1] by the planner
+  risk: ActionRisk;
+  requiresConfirmation: boolean;
+}
+```
+
+Workflows are ordered `WorkflowStep[]` lists of these constrained commands plus execution metadata (status, `resultSummary`, `resultData`). Multi-step JSON plans are **not** supported by the planner — single-action + the SW's auto-chain loop is the design.
+
+Still aspirational at the schema level:
+
+- locator candidates / fallbacks per action (today the planner returns one `selector`)
+- frame hints for cross-frame targets
 
 ## 8. Screenshot Capture
 
@@ -375,25 +501,27 @@ Sanitization:
 
 ## 10. Permissions Strategy
 
-### Recommended V1 Permissions
+### Current manifest _(implemented)_
+
+`src/manifest.json` currently requests:
 
 - `activeTab`
 - `scripting`
 - `storage`
+- `tabs` — used by `chrome.tabs.captureVisibleTab` for screenshots
+- `sidePanel` — required to register `ui/sidepanel.html` as the side panel
+- `host_permissions`: `<all_urls>`, `http://localhost:3001/*`, `https://localhost:3001/*` (the localhost entries are for the Fastify backend during dev)
 
-Optional:
+### Hardening recommendation _(aspirational)_
 
-- `tabs` only if still required after implementation review
+Before submitting to the Chrome Web Store:
 
-Recommendation:
+- drop `"<all_urls>"` from `host_permissions` and rely on `activeTab` for user-invoked sessions
+- promote durable host access to an _optional_ host permission requested only when a routine needs to replay against a specific origin
+- remove the localhost host permissions from the production manifest (they should live in a dev-only variant)
+- keep `tabs` only if `captureVisibleTab` continues to require it after the screenshot module is split out
 
-- remove `"<all_urls>"` from `host_permissions` for V1 if the extension is user-invoked on the active tab
-- use optional host permissions only if a later feature needs durable site access
-
-Reason:
-
-- the current manifest asks for broad host access
-- Miru's user-facing model is much easier to defend in review if access is temporary and user-invoked
+Miru's user-facing model is much easier to defend in review if access is temporary and user-invoked.
 
 ## 11. Security Requirements
 
@@ -430,15 +558,28 @@ If Miru processes user data remotely, it will also need:
 
 ## 13. UX Gating For Risky Actions
 
-Always require explicit approval for:
+### Today's rules _(implemented)_
 
-- typing into password or payment-related fields
+`shouldAutoExecute(mode, proposedAction)` in `src/background/serviceWorker.ts`:
+
+- **`auto`** — runs every action automatically **except `ASK_USER`**. The planner is instructed to emit `ASK_USER` only when truly blocked (ambiguous target, missing user choice). There is no per-action allowlist today.
+- **`ask`** — auto-runs only when `risk === "low"` **and** `requiresConfirmation === false`; otherwise sets `status = "awaiting_approval"` and waits for the Approve button.
+- **`interactive`** — never auto-runs; every action requires approval.
+- **`ASK_USER`** — never auto-runs in any mode; routed to `awaiting_input` + `pendingAsk`.
+
+The state strip above the composer makes the current gate explicit (`Miru is thinking`, `Running step`, `Waiting for your approval`, `Miru is asking you a question`).
+
+### Hardening recommendation _(aspirational)_
+
+The current `auto` mode trusts the planner's risk label. Before going beyond local dev, add an _additional_ SW-side allowlist that forces approval (regardless of planner output) for:
+
+- typing into `<input type="password">` or payment-related fields
 - multi-step form submission
-- clicking destructive controls
+- clicking destructive controls (`button[type="submit"]` on auth/payment forms, `delete`/`remove` buttons)
 - navigation away from the current origin
 - routine repairs that materially change saved workflow behavior
 
-Later, if auto-run is added, create a strict allowlist for actions that can run without confirmation.
+This list should live next to `shouldAutoExecute` and override `mode === "auto"` whenever it matches.
 
 ## 14. Error Handling
 

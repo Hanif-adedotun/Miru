@@ -1,5 +1,16 @@
 export type MiruMode = "auto" | "ask" | "interactive";
 
+export type SessionStatus =
+  | "idle"
+  | "capturing"
+  | "planning"
+  | "awaiting_approval"
+  | "awaiting_input"
+  | "ready"
+  | "executing"
+  | "complete"
+  | "error";
+
 export type ActionRisk = "low" | "medium" | "high";
 export type WorkflowStepStatus =
   | "planned"
@@ -76,6 +87,23 @@ export interface WorkflowStep {
   updatedAt: number;
 }
 
+export interface ScrapeArtifact {
+  id: string;
+  stepId: string;
+  createdAt: number;
+  source: "QUERY" | "EXTRACT" | "EXTRACT_LIST";
+  label: string;
+  columns: string[];
+  rows: Record<string, string>[];
+}
+
+export interface PendingAsk {
+  stepId: string;
+  question: string;
+  options?: string[];
+  createdAt: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -114,6 +142,12 @@ export interface ProposedAction {
   confidence: number;
   risk: ActionRisk;
   requiresConfirmation: boolean;
+}
+
+export interface ActionResultPayload {
+  success: boolean;
+  result?: unknown;
+  error?: string;
 }
 
 export interface PlanResponse {

@@ -5,12 +5,39 @@
 
 import { fetchNextActionStream } from "./plannerClient.js";
 import {
+  capturePageContext,
+  clearPageOverlay,
+  executeActionOnTab,
+  getActiveTab,
+  syncPageOverlay,
+} from "./browserOps.js";
+import {
+  answerRunAsk,
+  approveRunStep,
+  cancelRun,
+  initRunGateway,
+  resetSession,
+  isActiveRunInProgress,
+  resumeRunIfNeeded,
+  shouldDeferNavigationRefresh,
+  startRun,
+} from "./runGateway.js";
+import {
+  clearSession,
+  createEmptySession,
+  getStoredSession,
+  saveSession,
+} from "./sessionStore.js";
+import { broadcastStreamEvent, registerStreamPort } from "./streamHub.js";
+import { MIRU_USE_WS_RUNS } from "../generated/runtime-config.js";
+import {
   DEFAULT_PROMPT,
-  MAX_HISTORY_ITEMS,
   MESSAGE_SOURCE,
-  SCREENSHOT_QUALITY,
-  SESSION_STORAGE_KEY,
 } from "../shared/constants.js";
+import {
+  AUTO_OVERLAY_BANNER,
+  type PageAutomationOverlayPayload,
+} from "../shared/overlay.js";
 import type {
   ActionResultMessage,
   ActionResultPayload,
@@ -31,75 +58,113 @@ import type {
   SessionEvent,
   SessionResponseMessage,
   SessionState,
-  SessionStreamEventMessage,
+  SessionStatus,
   PlanNextActionPayload,
   StartSessionPayload,
   WorkflowStep,
   WorkflowStepStatus,
 } from "../shared/types.js";
 
-const SESSION_STREAM_PORT = "miru-session-stream";
-const streamPorts = new Set<chrome.runtime.Port>();
-
 const MAX_SCRAPE_ARTIFACTS = 40;
 const MAX_ROWS_PER_SCRAPE_ARTIFACT = 1500;
 
-/** Max plan→execute cycles per user send in auto mode (avoids infinite loops). */
+/** Max plan→execute cycles per user send across any mode (avoids infinite loops). */
 const AUTO_CHAIN_MAX_STEPS = 25;
-
-function createEmptySession(): SessionState {
-  return {
-    id: null,
-    mode: "interactive",
-    prompt: DEFAULT_PROMPT,
-    status: "idle",
-    history: [],
-    workflowSteps: [],
-    chatMessages: [
-      {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content:
-          "Describe the crawl or extraction flow you want. Miru will think in chat, run commands on the page, and can record the session as an exportable script.",
-        status: "complete",
-        createdAt: Date.now(),
-      },
-    ],
-    isRecording: false,
-    scrapeArtifacts: [],
-    pendingAsk: undefined,
-    updatedAt: Date.now(),
-  };
-}
 
 void chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((error) => console.error("[Miru] Failed to enable side panel action behavior:", error));
 
-function broadcastStreamEvent(event: PlannerStreamEvent): void {
-  const message: SessionStreamEventMessage = {
-    type: "SESSION_STREAM_EVENT",
-    payload: event,
-  };
+chrome.runtime.onConnect.addListener((port) => {
+  registerStreamPort(port);
+});
 
-  for (const port of streamPorts) {
-    try {
-      port.postMessage(message);
-    } catch {
-      streamPorts.delete(port);
-    }
-  }
+if (MIRU_USE_WS_RUNS) {
+  initRunGateway();
 }
 
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== SESSION_STREAM_PORT) {
+/**
+ * Statuses during which the SW is mid-cycle and a background refresh would race
+ * with planForSession / executePendingAction. We only auto-refresh when the
+ * session is at rest.
+ */
+const BACKGROUND_REFRESH_BUSY_STATUSES: ReadonlySet<SessionStatus> = new Set([
+  "capturing",
+  "planning",
+  "executing",
+]);
+
+/**
+ * In-memory lock so two near-simultaneous `tabs.onUpdated` events (loading then
+ * complete, or two SPA route changes) don't pile up overlapping DOM captures.
+ */
+let backgroundRefreshInFlight = false;
+
+/**
+ * Auto-refresh `currentContext` when the bound tab finishes navigating, so the
+ * UI banner reflects what Miru actually sees without the user having to send a
+ * new prompt. Skips when the session is busy, when no URL change occurred, and
+ * when an auto-refresh is already running.
+ */
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") {
+    return;
+  }
+  if (!tab?.url || (!tab.url.startsWith("http://") && !tab.url.startsWith("https://"))) {
     return;
   }
 
-  streamPorts.add(port);
-  port.onDisconnect.addListener(() => {
-    streamPorts.delete(port);
-  });
+  void (async () => {
+    if (backgroundRefreshInFlight) {
+      return;
+    }
+
+    const session = await getStoredSession();
+    if (!session.id || session.tabId !== tabId) {
+      return;
+    }
+    if (MIRU_USE_WS_RUNS && (shouldDeferNavigationRefresh() || (await isActiveRunInProgress()))) {
+      return;
+    }
+    if (BACKGROUND_REFRESH_BUSY_STATUSES.has(session.status)) {
+      return;
+    }
+    if (session.pendingAction || session.pendingAsk) {
+      // Don't clobber an in-flight plan or pending ask with a navigation
+      // refresh; the user is mid-decision.
+      return;
+    }
+    if (session.currentContext?.url === tab.url) {
+      return;
+    }
+
+    backgroundRefreshInFlight = true;
+    try {
+      console.log(`[Miru] auto-refresh on navigation: ${tab.url}`);
+      const capturing = await saveSession({ ...session, status: "capturing" });
+      const refreshed = await updateSessionContext(capturing, "Tab navigated", {
+        tab,
+        silent: true,
+        silentHistory: false,
+      });
+      // updateSessionContext leaves status untouched; restore to "ready" so
+      // the UI doesn't appear permanently "capturing" after the refresh.
+      await saveSession({ ...refreshed, status: "ready" });
+    } catch (error) {
+      console.warn("[Miru] Background context refresh failed:", error);
+      // Best-effort: clear the "capturing" status so the UI doesn't hang.
+      try {
+        const recovered = await getStoredSession();
+        if (recovered.status === "capturing") {
+          await saveSession({ ...recovered, status: "ready" });
+        }
+      } catch {
+        // ignore
+      }
+    } finally {
+      backgroundRefreshInFlight = false;
+    }
+  })();
 });
 
 function makeEvent(title: string, detail: string, status: SessionEvent["status"]): SessionEvent {
@@ -424,89 +489,32 @@ function getOrCreateRecording(session: SessionState): RecordedSession {
   );
 }
 
-async function getStoredSession(): Promise<SessionState> {
-  const result = await chrome.storage.session.get(SESSION_STORAGE_KEY);
-  return (result[SESSION_STORAGE_KEY] as SessionState | undefined) ?? createEmptySession();
+async function clearAutoPageOverlay(tabId: number | undefined): Promise<void> {
+  await clearPageOverlay(tabId);
 }
 
-async function saveSession(session: SessionState): Promise<SessionState> {
-  const nextSession: SessionState = {
-    ...session,
-    history: session.history.slice(-MAX_HISTORY_ITEMS),
-    workflowSteps: (session.workflowSteps ?? []).slice(-50),
-    scrapeArtifacts: trimScrapeArtifacts(session.scrapeArtifacts),
-    chatMessages: (session.chatMessages ?? []).slice(-30),
-    updatedAt: Date.now(),
-  };
-
-  await chrome.storage.session.set({ [SESSION_STORAGE_KEY]: nextSession });
-  return nextSession;
-}
-
-async function clearSession(): Promise<void> {
-  await chrome.storage.session.remove(SESSION_STORAGE_KEY);
-}
-
-async function getActiveTab(): Promise<chrome.tabs.Tab> {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id || !tab.windowId) {
-    throw new Error("No active browser tab found.");
+async function updateAutoPageOverlay(
+  tabId: number | undefined,
+  mode: MiruMode,
+  update: Omit<PageAutomationOverlayPayload, "active" | "message"> & {
+    active?: boolean;
+    message?: string;
+  }
+): Promise<void> {
+  if (!tabId) {
+    return;
   }
 
-  return tab;
-}
-
-async function ensureContentScriptInjected(tabId: number): Promise<void> {
-  try {
-    await chrome.tabs.sendMessage(tabId, {
-      type: "PING",
-      source: MESSAGE_SOURCE,
-    } as Message);
-  } catch {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content/contentScript.js"],
-    });
-    await new Promise((resolve) => setTimeout(resolve, 120));
-  }
-}
-
-async function capturePageContext(tab: chrome.tabs.Tab): Promise<PageContext> {
-  if (!tab.id || !tab.windowId) {
-    throw new Error("Active tab is missing required identifiers.");
+  if (update.active === false) {
+    await clearPageOverlay(tabId);
+    return;
   }
 
-  await ensureContentScriptInjected(tab.id);
-
-  const response = (await chrome.tabs.sendMessage(tab.id, {
-    type: "GET_PAGE_CONTEXT",
-    source: MESSAGE_SOURCE,
-  } as Message)) as ActionResultMessage | ErrorMessage;
-
-  if (response.type === "ERROR") {
-    throw new Error(response.error || "Failed to read page context.");
-  }
-
-  if (!response.payload.success) {
-    throw new Error(response.payload.error || "Failed to read page context.");
-  }
-
-  const context = response.payload.result as PageContext;
-  let screenshotDataUrl: string | undefined;
-
-  try {
-    screenshotDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: SCREENSHOT_QUALITY,
-    });
-  } catch (error) {
-    console.warn("[Miru] Screenshot capture failed:", error);
-  }
-
-  return {
-    ...context,
-    screenshotDataUrl,
-  };
+  await syncPageOverlay(tabId, {
+    active: true,
+    message: AUTO_OVERLAY_BANNER,
+    ...update,
+  });
 }
 
 function shouldAutoExecute(mode: MiruMode, action: ProposedAction): boolean {
@@ -523,6 +531,34 @@ function shouldAutoExecute(mode: MiruMode, action: ProposedAction): boolean {
   }
 
   return true;
+}
+
+/**
+ * Decide whether the SW should keep planning the *next* step on its own.
+ *
+ * This is the orthogonal gate to `shouldAutoExecute`: execution decides whether
+ * we may run an already-planned action without user confirmation; continuation
+ * decides whether we may re-enter `planForSession` after a step finished.
+ *
+ * Across every mode we want the loop to keep moving so the user does not have
+ * to send a new prompt after every single step — the per-iteration approval
+ * gate (`shouldAutoExecute`) is what holds back risky actions in ask /
+ * interactive modes.
+ */
+function shouldAutoContinue(
+  mode: MiruMode,
+  status: SessionStatus,
+  lastAction: MiruAction | undefined
+): boolean {
+  if (status !== "ready") {
+    return false;
+  }
+
+  if (lastAction?.type === "STOP") {
+    return false;
+  }
+
+  return mode === "auto" || mode === "ask" || mode === "interactive";
 }
 
 function lastWorkflowStep(session: SessionState): WorkflowStep | undefined {
@@ -547,6 +583,8 @@ async function routeAskUser(session: SessionState): Promise<SessionState> {
     options: action.action.options,
     createdAt: Date.now(),
   };
+
+  await clearAutoPageOverlay(session.tabId);
 
   let next: SessionState = {
     ...session,
@@ -575,16 +613,25 @@ async function routeAskUser(session: SessionState): Promise<SessionState> {
 }
 
 /**
- * After a successful action in auto mode, keep planning and executing until STOP,
- * approval is required, an error, or the step cap — so multi-step goals are not stuck after one QUERY/CLICK.
+ * After a successful action, keep planning and executing until one of:
+ *   - the planner returns STOP,
+ *   - the planner returns ASK_USER (routed to `awaiting_input`),
+ *   - the next planned action is not auto-executable in the current mode
+ *     (sets `awaiting_approval`; the user resumes the chain by approving),
+ *   - executePendingAction errors,
+ *   - the step cap is hit.
+ *
+ * This loop is intentionally mode-agnostic: ask / interactive modes also chain,
+ * stopping at each step that needs approval rather than after the very first
+ * step. The per-step `shouldAutoExecute` gate is what enforces the
+ * mode-specific approval policy.
  */
-async function runAutoModeContinuation(session: SessionState): Promise<SessionState> {
-  if (session.mode !== "auto" || session.status !== "ready") {
-    return session;
-  }
-
+async function runWorkflowContinuation(session: SessionState): Promise<SessionState> {
   const initialLast = lastWorkflowStep(session);
-  if (initialLast?.status === "succeeded" && initialLast.action.type === "STOP") {
+  if (!shouldAutoContinue(session.mode, session.status, initialLast?.action)) {
+    console.log(
+      `[Miru] chain skipped entry mode=${session.mode} status=${session.status} lastAction=${initialLast?.action.type ?? "none"}`
+    );
     return session;
   }
 
@@ -593,6 +640,10 @@ async function runAutoModeContinuation(session: SessionState): Promise<SessionSt
   for (let i = 0; i < AUTO_CHAIN_MAX_STEPS; i++) {
     current = await saveSession({ ...current, status: "planning" });
     current = await planForSession(current);
+    const plannedAction = current.pendingAction?.action.type ?? "none";
+    console.log(
+      `[Miru] chain iter=${i} mode=${current.mode} planStatus=${current.status} action=${plannedAction}`
+    );
 
     if (current.status === "error" || !current.pendingAction) {
       return current;
@@ -604,24 +655,52 @@ async function runAutoModeContinuation(session: SessionState): Promise<SessionSt
     }
 
     if (!shouldAutoExecute(current.mode, current.pendingAction)) {
-      return current;
+      // Next step needs approval in this mode; stop here and let the user
+      // approve. The approval handler re-enters runWorkflowContinuation.
+      console.log(
+        `[Miru] chain iter=${i} pausing for approval (action=${plannedAction})`
+      );
+      await clearAutoPageOverlay(current.tabId);
+      // Surface a one-line system pill so the user sees *why* the chain
+      // paused, even if the state strip is scrolled out of view.
+      current = appendChatMessages(
+        current,
+        createChatMessage(
+          "system",
+          `Paused for approval before ${plannedAction.toLowerCase()}. Press Approve above to continue.`,
+          "complete"
+        )
+      );
+      return saveSession(current);
     }
 
     current = await executePendingAction(current);
+    const executedAction = lastWorkflowStep(current);
+    console.log(
+      `[Miru] chain iter=${i} execStatus=${current.status} ranAction=${executedAction?.action.type ?? "none"} stepStatus=${executedAction?.status ?? "n/a"}`
+    );
 
     if (current.status === "error") {
+      await clearAutoPageOverlay(current.tabId);
       return current;
     }
 
-    const done = lastWorkflowStep(current);
-    if (done?.status === "succeeded" && done.action.type === "STOP") {
+    if (executedAction?.status === "succeeded" && executedAction.action.type === "STOP") {
+      await clearAutoPageOverlay(current.tabId);
       return current;
     }
 
-    if (current.mode !== "auto" || current.status !== "ready") {
+    if (!shouldAutoContinue(current.mode, current.status, executedAction?.action)) {
+      console.log(
+        `[Miru] chain iter=${i} exiting after exec — mode=${current.mode} status=${current.status} lastAction=${executedAction?.action.type ?? "none"}`
+      );
+      await clearAutoPageOverlay(current.tabId);
       return current;
     }
   }
+
+  console.log(`[Miru] chain hit step cap of ${AUTO_CHAIN_MAX_STEPS}`);
+  await clearAutoPageOverlay(current.tabId);
 
   return appendChatMessages(
     await saveSession({
@@ -629,7 +708,7 @@ async function runAutoModeContinuation(session: SessionState): Promise<SessionSt
       history: [
         ...current.history,
         makeEvent(
-          "Auto chain limit",
+          "Chain limit",
           `Stopped after ${AUTO_CHAIN_MAX_STEPS} chained actions. Send another message to continue.`,
           "warning"
         ),
@@ -637,31 +716,27 @@ async function runAutoModeContinuation(session: SessionState): Promise<SessionSt
     }),
     createChatMessage(
       "system",
-      `Auto mode paused after ${AUTO_CHAIN_MAX_STEPS} steps in one run. Send a message to continue.`,
+      `Paused after ${AUTO_CHAIN_MAX_STEPS} steps in one run. Send a message to continue.`,
       "complete"
     )
   );
 }
 
-async function executeAction(tabId: number, action: MiruAction): Promise<ActionResultPayload> {
-  const response = (await chrome.tabs.sendMessage(tabId, {
-    type: "EXECUTE_ACTION",
-    source: MESSAGE_SOURCE,
-    payload: action,
-  } as Message)) as ActionResultMessage | ErrorMessage;
-
-  if (response.type === "ERROR") {
-    return {
-      success: false,
-      error: response.error,
-    };
-  }
-
-  return response.payload;
+interface UpdateContextOptions {
+  /** When provided, capture from this specific tab instead of querying for the active tab. */
+  tab?: chrome.tabs.Tab;
+  /** Suppress the "I can see <url>" chat message — used for background auto-refresh. */
+  silent?: boolean;
+  /** Suppress the history event line too — useful for cheap re-captures. */
+  silentHistory?: boolean;
 }
 
-async function updateSessionContext(session: SessionState, title = "Context refreshed"): Promise<SessionState> {
-  const tab = await getActiveTab();
+async function updateSessionContext(
+  session: SessionState,
+  title = "Context refreshed",
+  options: UpdateContextOptions = {}
+): Promise<SessionState> {
+  const tab = options.tab ?? (await getActiveTab());
   const context = await capturePageContext(tab);
 
   let nextSession: SessionState = {
@@ -669,10 +744,15 @@ async function updateSessionContext(session: SessionState, title = "Context refr
     tabId: tab.id,
     origin: new URL(tab.url || context.url).origin,
     currentContext: context,
-    history: [...session.history, makeEvent(title, context.title || context.url, "info")],
+    history: options.silentHistory
+      ? session.history
+      : [...session.history, makeEvent(title, context.title || context.url, "info")],
   };
 
-  if (!(session.chatMessages ?? []).some((message) => message.content.includes(context.url))) {
+  if (
+    !options.silent &&
+    !(session.chatMessages ?? []).some((message) => message.content.includes(context.url))
+  ) {
     nextSession = appendChatMessages(
       nextSession,
       createChatMessage("assistant", `I can see ${context.url}. I now have live DOM and screenshot context.`, "complete")
@@ -698,6 +778,8 @@ async function planForSession(session: SessionState): Promise<SessionState> {
     routine: session.activeRoutine,
   };
   const streamMessageId = crypto.randomUUID();
+  await updateAutoPageOverlay(session.tabId, session.mode, { phase: "planning" });
+
   let streamingSession = await saveSession(
     appendChatMessages(
       {
@@ -797,7 +879,17 @@ async function planForSession(session: SessionState): Promise<SessionState> {
       }
     );
 
-    return saveSession(plannedSession);
+    const saved = await saveSession(plannedSession);
+    if (isAsk || !willAutoRun) {
+      await clearAutoPageOverlay(saved.tabId);
+    } else {
+      await updateAutoPageOverlay(saved.tabId, saved.mode, {
+        phase: "preview",
+        action: proposedAction.action,
+        rationale: proposedAction.rationale,
+      });
+    }
+    return saved;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Planning failed.";
     const cur = (streamingSession.chatMessages ?? []).find((item) => item.id === streamMessageId);
@@ -811,12 +903,14 @@ async function planForSession(session: SessionState): Promise<SessionState> {
       });
     }
 
-    return saveSession({
+    const failed = await saveSession({
       ...streamingSession,
       status: "error",
       lastError: message,
       history: [...streamingSession.history, makeEvent("Planning failed", message, "error")],
     });
+    await clearAutoPageOverlay(failed.tabId);
+    return failed;
   }
 }
 
@@ -830,6 +924,12 @@ async function executePendingAction(session: SessionState): Promise<SessionState
   }
 
   const action = session.pendingAction;
+  await updateAutoPageOverlay(session.tabId, session.mode, {
+    phase: "executing",
+    action: action.action,
+    rationale: action.rationale,
+  });
+
   let workingSession = await saveSession(
     appendChatMessages(
       {
@@ -839,7 +939,7 @@ async function executePendingAction(session: SessionState): Promise<SessionState
       createChatMessage("assistant", `Running ${action.action.type.toLowerCase()} on the page.`, "running", action.id)
     )
   );
-  const result = await executeAction(session.tabId, action.action);
+  const result = await executeActionOnTab(session.tabId, action.action);
   const eventStatus = result.success ? "success" : "error";
   const artifact =
     result.success ? buildScrapeArtifact(action.id, action.action, result.result) : null;
@@ -896,10 +996,18 @@ async function executePendingAction(session: SessionState): Promise<SessionState
     nextSession = await updateSessionContext(nextSession, "Context refreshed after action");
   }
 
+  if (!result.success || nextSession.status === "error" || action.action.type === "STOP") {
+    await clearAutoPageOverlay(nextSession.tabId);
+  }
+
   return nextSession;
 }
 
 async function startSession(payload: StartSessionPayload): Promise<SessionState> {
+  if (MIRU_USE_WS_RUNS) {
+    return startRun(payload);
+  }
+
   const tab = await getActiveTab();
   const baseSession = appendChatMessages(
     {
@@ -937,7 +1045,7 @@ async function startSession(payload: StartSessionPayload): Promise<SessionState>
       session = await routeAskUser(session);
     } else if (shouldAutoExecute(session.mode, session.pendingAction)) {
       session = await executePendingAction(session);
-      session = await runAutoModeContinuation(session);
+      session = await runWorkflowContinuation(session);
     }
   }
 
@@ -988,9 +1096,77 @@ chrome.runtime.onMessage.addListener(
       return true;
     }
 
-    if (message.type === "START_SESSION") {
+    if (message.type === "SYNC_PANEL_OPEN") {
+      void respondWithSession(async () => {
+        let session = await getStoredSession();
+        if (!session.id) {
+          return;
+        }
+
+        const tab = await getActiveTab();
+        session = await saveSession({
+          ...session,
+          tabId: tab.id,
+          origin: tab.url ? new URL(tab.url).origin : session.origin,
+          status: "capturing",
+        });
+        const refreshed = await updateSessionContext(session, "Panel opened", {
+          tab,
+          silent: true,
+          silentHistory: true,
+        });
+        // Restore a resting status unless the session was mid-gate.
+        const restingStatus: SessionState["status"] =
+          refreshed.status === "awaiting_approval" ||
+          refreshed.status === "awaiting_input" ||
+          refreshed.status === "error"
+            ? refreshed.status
+            : "ready";
+        await saveSession({ ...refreshed, status: restingStatus });
+      });
+      return true;
+    }
+
+    if (message.type === "START_SESSION" || message.type === "START_RUN") {
       void respondWithSession(async () => {
         await startSession(message.payload as StartSessionPayload);
+      });
+      return true;
+    }
+
+    if (message.type === "APPROVE_RUN_STEP") {
+      void respondWithSession(async () => {
+        const payload = (message.payload ?? {}) as { stepId: string };
+        await approveRunStep(payload.stepId);
+      });
+      return true;
+    }
+
+    if (message.type === "ANSWER_RUN_ASK") {
+      void respondWithSession(async () => {
+        const payload = (message.payload ?? {}) as RespondToAskPayload;
+        if (payload.answer?.trim()) {
+          await answerRunAsk(payload.stepId, payload.answer.trim());
+        }
+      });
+      return true;
+    }
+
+    if (message.type === "CANCEL_RUN") {
+      void respondWithSession(async () => {
+        await cancelRun();
+      });
+      return true;
+    }
+
+    if (message.type === "SYNC_RUN") {
+      void respondWithSession(async () => {
+        if (MIRU_USE_WS_RUNS) {
+          const session = await getStoredSession();
+          if (session.runId) {
+            await resumeRunIfNeeded();
+          }
+        }
       });
       return true;
     }
@@ -999,6 +1175,16 @@ chrome.runtime.onMessage.addListener(
       void respondWithSession(async () => {
         const payload = (message.payload ?? {}) as PlanNextActionPayload;
         let session = await getStoredSession();
+
+        if (MIRU_USE_WS_RUNS && payload.userMessage?.trim()) {
+          const mode = payload.mode === "auto" || payload.mode === "ask" ? payload.mode : session.mode;
+          if (session.runId) {
+            await cancelRun();
+          }
+          await startRun({ prompt: payload.userMessage.trim(), mode });
+          return;
+        }
+
         if (payload.mode === "auto" || payload.mode === "ask") {
           session = { ...session, mode: payload.mode };
         }
@@ -1021,7 +1207,7 @@ chrome.runtime.onMessage.addListener(
             await routeAskUser(planned);
           } else if (shouldAutoExecute(planned.mode, planned.pendingAction)) {
             let after = await executePendingAction(planned);
-            after = await runAutoModeContinuation(after);
+            after = await runWorkflowContinuation(after);
             await saveSession(after);
           }
         }
@@ -1037,7 +1223,13 @@ chrome.runtime.onMessage.addListener(
           return;
         }
 
-        let session = await getStoredSession();
+        const existing = await getStoredSession();
+        if (MIRU_USE_WS_RUNS && existing.runId) {
+          await answerRunAsk(payload.stepId, answer);
+          return;
+        }
+
+        let session = existing;
         session = await saveSession(
           appendChatMessages(
             {
@@ -1059,7 +1251,7 @@ chrome.runtime.onMessage.addListener(
             await routeAskUser(planned);
           } else if (shouldAutoExecute(planned.mode, planned.pendingAction)) {
             let after = await executePendingAction(planned);
-            after = await runAutoModeContinuation(after);
+            after = await runWorkflowContinuation(after);
             await saveSession(after);
           }
         }
@@ -1131,9 +1323,14 @@ chrome.runtime.onMessage.addListener(
 
     if (message.type === "APPROVE_PENDING_ACTION") {
       void respondWithSession(async () => {
-        const session = await saveSession({ ...(await getStoredSession()), status: "executing" });
-        let after = await executePendingAction(session);
-        after = await runAutoModeContinuation(after);
+        const session = await getStoredSession();
+        if (MIRU_USE_WS_RUNS && session.runId && session.pendingAction) {
+          await approveRunStep(session.pendingAction.id);
+          return;
+        }
+        const executing = await saveSession({ ...session, status: "executing" });
+        let after = await executePendingAction(executing);
+        after = await runWorkflowContinuation(after);
         await saveSession(after);
       });
       return true;
@@ -1141,7 +1338,13 @@ chrome.runtime.onMessage.addListener(
 
     if (message.type === "STOP_SESSION") {
       void (async () => {
-        await clearSession();
+        if (MIRU_USE_WS_RUNS) {
+          await resetSession();
+        } else {
+          const session = await getStoredSession();
+          await clearPageOverlay(session.tabId);
+          await clearSession();
+        }
         sendResponse(await getSessionResponse());
       })();
       return true;
